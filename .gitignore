@@ -1,0 +1,65 @@
+# Reference copies are kept locally, outside the service repository.
+/ref/
+
+# Python and other local virtual environments and caches.
+.venv/
+.venv-*/
+venv/
+venv-*/
+env/
+.env/
+virtualenv/
+.tox/
+.nox/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+htmlcov/
+*.egg-info/
+.coverage
+.coverage.*
+*.py[cod]
+
+# Native, cross, Rust, and documentation build trees.
+build/
+build-*/
+build_*/
+cmake-build-*/
+target/
+dist/
+out/
+output/
+site/
+CMakeFiles/
+Testing/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+*.o
+*.a
+*.so
+*.elf
+*.map
+*.d
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# Runtime state, temporary files, and editor leftovers.
+.xbld_history
+.xbld_state.json
+.avr_xbld_state.json
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Executables and packages staged by make deploy.
+/deploy/*
+!/deploy/.gitignore

@@ -1,0 +1,31 @@
+[package]
+name = "dal-pdu-gui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Terminal Modbus RTU monitor and register editor for DAL PDU HW1.1"
+default-run = "dal-pdu-gui"
+autobins = false
+
+[[bin]]
+name = "dal-pdu-gui"
+path = "src/main.rs"
+
+[[bin]]
+name = "dal-pdu-desktop"
+path = "src/bin/desktop.rs"
+required-features = ["desktop"]
+
+[features]
+default = []
+desktop = ["dep:eframe"]
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+eframe = { optional = true, version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+serialport = { version = "4.8.1", default-features = false }
+
+[profile.release]
+strip = true
+lto = "thin"

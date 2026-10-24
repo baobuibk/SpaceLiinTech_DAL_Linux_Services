@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""DAL PDU AVR bootloader client with the SAM xbld command menu."""
+
+import argparse
+import json
+from pathlib import Path
+import shlex
+import sys
+import time
+
+from boot_host import APP_LIMIT, BOOT_START, HW_ID, META_ADDR, Link, encode_frame, read_hex, validate_package
+
+
+DEFAULT_PORT = "/dev/ttyS3"
+DEFAULT_BAUD = 115200
+DEFAULT_FIRMWARE_DIR = Path("/home/bee/firmware/PDU")
+STATE_FILE = Path.home() / ".avr_xbld_state.json"
+
+MENU = """
+  ping                             - Application text CLI or bootloader info
+  reboot                           - Enter bootloader, then ping
+  check                            - Scan for packaged AVR hex files
+  bootinfo                         - Display boot information
+  erase  [backup]                  - Erase main slot (backup unsupported)
+  write  <N|path|latest> [backup]  - Write packaged firmware after erase
+  verify [backup]                  - Verify image CRC
+  jump   [backup]                  - Jump to application
+  flash  <N|path|latest> [backup]  - Full: reboot+erase+write+verify+jump
+  status                           - Bootloader state
+  read   <addr>                    - Read up to 160 flash bytes
+  dump   <addr> <size> <file>      - Save flash to a binary file
+  xbldinfo                         - Show last write/flash attempt (host-only)
+  help                             - This help
+  exit                             - Quit
+
+  Tip: run 'check' first, then 'write 1' or 'flash 2'
+  Tip: 'flash latest' / 'write latest' to pick the newest file
+"""
+
+
+def modbus_reset_frame(slave):
+    if not 1 <= slave <= 247:
+        raise ValueError("Modbus slave must be 1..247")
+    # Holding register 40060 is zero-based RTU address 59 (0x003B).
+    request = bytes((slave, 0x06, 0x00, 0x3B, 0xB0, 0x07))
+    checksum = modbus_crc(request)
+    return request + checksum.to_bytes(2, "little")
+
+
+def modbus_crc(data):
+    result = 0xFFFF
+    for value in data:
+        result ^= value
+        for _ in range(8):
+            result = (result >> 1) ^ (0xA001 if result & 1 else 0)
+    return result
+
+
+def checked_image(path):
+    memory = read_hex(path)
+    return validate_package(memory)
+
+
+def list_images(directory):
+    entries = []
+    if not directory.is_dir():
+        print(f"  [ERROR] Could not open directory {directory}")
+        return entries
+    for path in sorted(directory.glob("*.hex"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            image, _ = checked_image(path)
+            entries.append(path)
+            print(f"  {len(entries):2d}. {path.name}  OK  {len(image)} bytes")
+        except (OSError, ValueError) as error:
+            print(f"      {path.name}  INVALID: {error}")
+    if not entries:
+        print("  No valid packaged AVR .hex files found")
+    return entries
+
+
+def resolve_image(token, catalog, directory):
+    if token == "latest":
+        if not catalog:
+            catalog = list_images(directory)
+        if not catalog:
+            raise ValueError("No valid firmware file found")
+        path = catalog[0]
+    elif token.isdecimal():
+        index = int(token)
+        if not 1 <= index <= len(catalog):
+            raise ValueError("Run 'check' first, then use a listed number")
+        path = catalog[index - 1]
+    else:
+        path = Path(token).expanduser()
+        if len(path.parts) == 1:
+            candidate = directory / path
+            if candidate.is_file() or not path.is_file():
+                path = candidate
+    image, header = checked_image(path)
+    return path, image, header
+
+
+def open_port(name, baud):
+    try:
+        import serial
+    except ImportError as error:
+        raise RuntimeError("pyserial is required (python3-pyserial on the OBC)") from error
+    return serial.Serial(name, baud, timeout=0.1, write_timeout=2, exclusive=True)
+
+
+def read_until(port, marker, timeout):
+    data = bytearray()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        data.extend(port.read(128))
+        if marker in data:
+            return bytes(data)
+    return bytes(data)
+
+
+def app_probe(port):
+    port.reset_input_buffer()
+    port.write(b"\r")
+    port.flush()
+    return b"> " in read_until(port, b"> ", 0.5)
+
+
+def boot_link(port, timeout=2):
+    port.reset_input_buffer()
+    port.write(encode_frame(0xFFFC, 0))  # Reset transport cache, not the MCU.
+    port.flush()
+    return Link(port, timeout=timeout)
+
+
+def geometry(link):
+    info = link.command(0x40, "bping")
+    expected = {"hw_id": HW_ID, "slots": 1, "s0_hdr": META_ADDR,
+                "s0_max": APP_LIMIT, "hdr_sz": 256, "meta_ver": 2, "app_addr": 0}
+    for key, value in expected.items():
+        if info.get(key) != value:
+            raise RuntimeError(f"Wrong bootloader geometry: {key}={info.get(key)!r}, expected {value!r}")
+    return info
+
+
+def request_bootloader(port):
+    port.reset_input_buffer()
+    port.write(b"bootloader confirm\r")
+    port.flush()
+    # The command resets without a text reply after committing the EEPROM request.
+    time.sleep(0.15)
+    return wait_for_bootloader(port, "text bootloader command")
+
+
+def request_bootloader_modbus(port, slave):
+    request = modbus_reset_frame(slave)
+    port.reset_input_buffer()
+    port.write(request)
+    port.flush()
+    reply = read_until(port, request, 1.5)
+    if request not in reply:
+        raise RuntimeError("No Modbus acknowledgment for BOOTLOADER_RESET (40060)")
+    time.sleep(0.2)
+    return wait_for_bootloader(port, "Modbus reset")
+
+
+def wait_for_bootloader(port, entry_name):
+    link = boot_link(port, timeout=1)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            link.command(0x48, "bhold")
+            geometry(link)
+            return link
+        except TimeoutError:
+            continue
+    raise RuntimeError(f"Bootloader did not respond after {entry_name}")
+
+
+def enter_bootloader(port, options):
+    if options.entry == "modbus":
+        return request_bootloader_modbus(port, options.slave)
+    return request_bootloader(port)
+
+
+def write_image(link, image, header):
+    for start, data in ((0, image), (META_ADDR, header)):
+        offset = 0
+        while offset < len(data):
+            address = start + offset
+            count = min(251, 256 - (address & 255), len(data) - offset)
+            link.write(address, data[offset:offset + count])
+            offset += count
+        print(f"  Written {len(data)} bytes at 0x{start:05X}")
+
+
+def save_state(path, status):
+    try:
+        STATE_FILE.write_text(json.dumps({"file": str(path), "status": status,
+                                          "timestamp": int(time.time())}) + "\n")
+    except OSError as error:
+        print(f"  [WARN] Could not save host update history: {error}", file=sys.stderr)
+
+
+def show_state():
+    if not STATE_FILE.is_file():
+        print("  No previous write or flash recorded")
+        return
+    print("  " + STATE_FILE.read_text().strip())
+
+
+def require_main(extra):
+    if extra and extra != ["main"] and extra != ["0"]:
+        raise ValueError("AVR bootloader has one application slot; backup is unsupported")
+
+
+def execute(command, operands, options, catalog):
+    if command == "check":
+        return list_images(options.firmware_dir)
+    if command == "xbldinfo":
+        show_state()
+        return catalog
+    if command == "help":
+        print(MENU)
+        print("Startup: avr_xbld --port DEV --baud RATE [--entry text|modbus] [--slave ID] [--firmware-dir DIR]")
+        print("Run avr_xbld --help for all one-shot arguments. Exit and restart to change startup options.")
+        return catalog
+    if command in ("erase", "verify", "jump"):
+        require_main(operands)
+    if command in ("write", "flash"):
+        if not operands:
+            raise ValueError(f"{command} requires <N|path|latest>")
+        require_main(operands[1:])
+        path, image, header = resolve_image(operands[0], catalog, options.firmware_dir)
+    with open_port(options.port, options.baud) as port:
+        if command == "ping":
+            if app_probe(port):
+                print("  [OK] Application text CLI responding")
+            else:
+                print("  [OK] Bootloader:", geometry(boot_link(port)))
+            return catalog
+        if command == "reboot":
+            print("  [OK] Bootloader:", geometry(enter_bootloader(port, options)))
+            return catalog
+        if command == "bootinfo" and app_probe(port):
+            port.write(b"bootinfo\r")
+            port.flush()
+            print(read_until(port, b"> ", 2).decode("utf-8", errors="replace"))
+            return catalog
+        if command == "flash":
+            print(f"  Entering bootloader via {options.entry}...")
+            link = enter_bootloader(port, options)
+        else:
+            link = boot_link(port)
+            geometry(link)
+        if command == "bootinfo":
+            print("  Version:", link.command(0x03, "version"))
+            print("  Status:", link.command(0x44, "bstatus"))
+        elif command == "status":
+            print("  Status:", link.command(0x44, "bstatus"))
+        elif command == "erase":
+            print("  Erasing:", link.command(0x41, "berase 0"))
+        elif command == "write":
+            link.command(0x48, "bhold")
+            save_state(path, "writing")
+            write_image(link, image, header)
+            save_state(path, "written")
+        elif command == "flash":
+            save_state(path, "erasing")
+            print("  Erasing:", link.command(0x41, "berase 0"))
+            save_state(path, "writing")
+            write_image(link, image, header)
+            save_state(path, "verifying")
+            print("  Verified:", link.command(0x42, "bverify 0"))
+            save_state(path, "verified")
+            link.command(0x43, "bjump 0")
+            save_state(path, "ok")
+            print("  [OK] Application started")
+        elif command == "verify":
+            print("  Verified:", link.command(0x42, "bverify 0"))
+        elif command == "jump":
+            print("  Jump:", link.command(0x43, "bjump 0"))
+        elif command in ("read", "dump"):
+            if len(operands) < (3 if command == "dump" else 1):
+                raise ValueError("read <addr> or dump <addr> <size> <file>")
+            address = int(operands[0], 0)
+            size = int(operands[1], 0) if command == "dump" else 160
+            if not 0 <= address < BOOT_START or not 1 <= size <= BOOT_START - address:
+                raise ValueError("Read range must stay below boot section 0x1E000")
+            data = bytearray()
+            while len(data) < size:
+                current = address + len(data)
+                count = min(160, size - len(data))
+                values = link.command(0x45, f"bread 0x{current:X} {count}")
+                block = values.get("data")
+                if not isinstance(block, bytes) or len(block) != count:
+                    raise RuntimeError(f"Short read at 0x{current:05X}")
+                data.extend(block)
+            if command == "dump":
+                Path(operands[2]).write_bytes(data)
+                print(f"  Saved {len(data)} bytes to {operands[2]}")
+            else:
+                for offset in range(0, len(data), 16):
+                    print(f"  {address + offset:05X}  {data[offset:offset + 16].hex(' ')}")
+        else:
+            raise ValueError(f"Unknown command: {command}")
+    return catalog
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, epilog=MENU,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--port", "-p", default=DEFAULT_PORT,
+                        help=f"OBC serial device (default: {DEFAULT_PORT})")
+    parser.add_argument("--baud", "-b", type=int, default=DEFAULT_BAUD,
+                        help=f"UART baud rate (default: {DEFAULT_BAUD})")
+    parser.add_argument("--slave", type=int, default=1, help="PDU Modbus slave address (default: 1)")
+    parser.add_argument("--entry", choices=("text", "modbus"), default="text",
+                        help="bootloader entry method (default: text)")
+    parser.add_argument("--firmware-dir", type=Path, default=DEFAULT_FIRMWARE_DIR,
+                        help=f"firmware scan directory (default: {DEFAULT_FIRMWARE_DIR})")
+    group = parser.add_mutually_exclusive_group()
+    for name in ("ping", "reboot", "erase", "verify", "jump", "status", "bootinfo", "xbldinfo"):
+        group.add_argument(f"--{name}", action="store_true")
+    for name in ("flash", "write"):
+        group.add_argument(f"--{name}", metavar="FILE|latest")
+    parser.add_argument("--slot", type=int, choices=(0,), default=0,
+                        help="AVR has one slot; only 0 is supported")
+    parser.add_argument("--backup", action="store_true", help="unsupported by AVR bootloader")
+    args = parser.parse_args()
+    if args.backup:
+        parser.error("AVR bootloader has no backup slot")
+    if args.baud <= 0:
+        parser.error("baud must be positive")
+    if not 1 <= args.slave <= 247:
+        parser.error("slave must be 1..247")
+    one_shot = next((name for name in ("ping", "reboot", "erase", "verify", "jump", "status", "bootinfo", "xbldinfo")
+                     if getattr(args, name)), None)
+    if args.flash is not None:
+        one_shot = "flash"
+        operands = [args.flash]
+    elif args.write is not None:
+        one_shot = "write"
+        operands = [args.write]
+    else:
+        operands = []
+    catalog = []
+    if one_shot:
+        execute(one_shot, operands, args, catalog)
+        return 0
+    print("\n  xBLD Bootloader Shell [AVR PDU]  -  type 'help' for usage\n")
+    execute("help", [], args, catalog)
+    while True:
+        try:
+            line = input("xbld> ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        try:
+            tokens = shlex.split(line)
+            if not tokens:
+                continue
+            if tokens[0] in ("exit", "quit"):
+                return 0
+            catalog = execute(tokens[0], tokens[1:], args, catalog)
+        except (OSError, ValueError, RuntimeError, TimeoutError) as error:
+            print(f"  [FAIL] {error}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, RuntimeError, TimeoutError) as error:
+        print(f"[FAIL] {error}", file=sys.stderr)
+        raise SystemExit(1)

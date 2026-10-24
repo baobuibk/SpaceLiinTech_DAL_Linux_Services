@@ -1,0 +1,7 @@
+site_name: DAL Bootloader OTA Manual
+site_description: Updating EXP and PDU firmware from the OBC
+docs_dir: docs
+nav:
+  - Overview: index.md
+  - EXP (SAMV71): exp.md
+  - PDU (AVR): pdu.md
