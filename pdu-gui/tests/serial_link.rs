@@ -140,3 +140,80 @@ fn a_lost_write_reply_times_out_without_retransmitting() {
     assert!(start.elapsed() < Duration::from_secs(1));
     server.join().unwrap();
 }
+
+#[test]
+fn uart0_text_command_and_modbus_poll_share_one_serial_session() {
+    let (mut master, slave) = serialport::TTYPort::pair().unwrap();
+    master.set_timeout(Duration::from_secs(3)).unwrap();
+    let path = slave.name().unwrap();
+    let server = thread::spawn(move || {
+        let mut text_seen = false;
+        let mut polls_after_text = 0;
+        loop {
+            let mut first = [0];
+            if master.read_exact(&mut first).is_err() {
+                break;
+            }
+            if first[0] == b'h' {
+                let mut rest = [0; 4];
+                master.read_exact(&mut rest).unwrap();
+                assert_eq!(&rest, b"elp\r");
+                master
+                    .write_all(b"help\r\nAvailable commands\r\n> ")
+                    .unwrap();
+                text_seen = true;
+            } else {
+                let mut rest = [0; 7];
+                master.read_exact(&mut rest).unwrap();
+                let request = [first.as_slice(), rest.as_slice()].concat();
+                assert_eq!(request[0], 1);
+                let function = request[1];
+                assert!((1..=4).contains(&function));
+                let count = u16::from_be_bytes([request[4], request[5]]) as usize;
+                let bytes = if function <= 2 {
+                    count.div_ceil(8)
+                } else {
+                    count * 2
+                };
+                let mut payload = vec![bytes as u8];
+                payload.resize(bytes + 1, 0);
+                master.write_all(&frame(1, function, &payload)).unwrap();
+                if text_seen {
+                    polls_after_text += 1;
+                    if polls_after_text >= 2 {
+                        break;
+                    }
+                }
+            }
+        }
+        (text_seen, polls_after_text)
+    });
+    let worker = Worker::start(Config {
+        port: path,
+        baud: 115200,
+        unit: 1,
+        timeout_ms: 200,
+    });
+    loop {
+        if let Event::Snapshot(_, _) = worker.events.recv_timeout(Duration::from_secs(5)).unwrap() {
+            break;
+        }
+    }
+    worker
+        .commands
+        .send(dal_pdu_gui::worker::Command::Console("help".into()))
+        .unwrap();
+    loop {
+        match worker.events.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Event::ConsoleResult(result) => {
+                assert_eq!(result.unwrap(), b"help\r\nAvailable commands\r\n> ");
+                break;
+            }
+            Event::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let (text_seen, polls_after_text) = server.join().unwrap();
+    assert!(text_seen);
+    assert_eq!(polls_after_text, 2);
+}

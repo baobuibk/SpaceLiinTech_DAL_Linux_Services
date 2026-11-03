@@ -1,0 +1,18 @@
+[Unit]
+Description=BME688 Environmental Sensor Service
+After=sysinit.target local-fs.target
+DefaultDependencies=no
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+RuntimeDirectory=dal/bme688
+ExecStart=/home/root/tools/bin/bme_service -d /dev/i2c-0 -o /run/dal/bme688
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

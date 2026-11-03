@@ -1,0 +1,24 @@
+[package]
+name = "exp_test_gui"
+version = "0.1.0"
+edition = "2021"
+default-run = "exp_test_gui"
+
+[features]
+default = []
+desktop = ["dep:eframe"]
+
+[[bin]]
+name = "exp_test_gui"
+path = "src/bin/exp_tui.rs"
+
+[[bin]]
+name = "exp_test_gui_desktop"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[dependencies]
+eframe = { version = "0.31", optional = true }
+serialport = { version = "4.7", default-features = false }
+ratatui = "0.29"
+crossterm = "0.28"

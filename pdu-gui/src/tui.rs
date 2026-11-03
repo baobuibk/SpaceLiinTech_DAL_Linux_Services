@@ -5,6 +5,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use dal_pdu_gui::{
+    console::{same_port, Console, Event as ConsoleEvent},
     map::{self, Bank, Row as Parameter},
     worker::{Command, Config, Event, Worker},
 };
@@ -43,6 +44,7 @@ enum Dialog {
     Edit { index: usize, text: String },
     Confirm { index: usize, text: String },
     Settings { fields: [String; 4], active: usize },
+    ConsoleSettings { fields: [String; 2], active: usize },
     Log,
 }
 struct App {
@@ -59,10 +61,19 @@ struct App {
     last_scan: Option<Instant>,
     dialog: Option<Dialog>,
     quit: bool,
+    console: Option<Console>,
+    console_connected: bool,
+    console_shared: bool,
+    console_port: String,
+    console_baud: u32,
+    console_input: String,
+    console_output: String,
+    console_status: String,
 }
 impl App {
     fn new(config: Config) -> Self {
         let rows = map::rows();
+        let console_port = config.port.clone();
         Self {
             config,
             worker: None,
@@ -77,6 +88,14 @@ impl App {
             last_scan: None,
             dialog: None,
             quit: false,
+            console: None,
+            console_connected: false,
+            console_shared: false,
+            console_port,
+            console_baud: 115200,
+            console_input: String::new(),
+            console_output: String::new(),
+            console_status: "Disconnected".into(),
         }
     }
     fn indices(&self) -> Vec<usize> {
@@ -99,15 +118,58 @@ impl App {
         if self.worker.is_some() {
             self.worker = None;
             self.connected = false;
+            if self.console_shared {
+                self.console_shared = false;
+                self.console_connected = false;
+                self.console_status = "Modbus link closed; console disconnected".into();
+            }
             self.writing = false;
             self.values.fill(Err("Disconnected".into()));
             self.last_scan = None;
             self.note("Disconnected".into());
         } else {
+            if self.console.is_some() && same_port(&self.console_port, &self.config.port) {
+                self.note("Close the text console before opening Modbus on the same port".into());
+                return;
+            }
             self.values.fill(Err("Waiting for reply".into()));
             self.last_scan = None;
             self.worker = Some(Worker::start(self.config.clone()));
             self.note("Opening serial port…".into());
+        }
+    }
+    fn connect_console(&mut self) {
+        if self.console.is_some() || self.console_shared {
+            self.console = None;
+            self.console_shared = false;
+            self.console_connected = false;
+            self.console_status = "Disconnected".into();
+        } else if self.console_port.trim().is_empty() {
+            self.console_status = "Enter a console port with F2".into();
+        } else if self.worker.is_some() && same_port(&self.console_port, &self.config.port) {
+            if self.console_baud != self.config.baud {
+                self.console_status = "Shared port must use the Modbus baud".into();
+            } else if self.connected {
+                self.console_shared = true;
+                self.console_connected = true;
+                self.console_status = "Attached to Modbus UART0 link".into();
+            } else {
+                self.console_status = "Wait for Modbus connection before attaching".into();
+            }
+        } else {
+            self.console = Some(Console::start(self.console_port.clone(), self.console_baud));
+            self.console_status = "Opening console…".into();
+        }
+    }
+    fn append_console_output(&mut self, bytes: &[u8]) {
+        self.console_output
+            .push_str(&String::from_utf8_lossy(bytes).replace('\r', ""));
+        if self.console_output.len() > 65536 {
+            let mut start = self.console_output.len() - 65536;
+            while !self.console_output.is_char_boundary(start) {
+                start += 1;
+            }
+            self.console_output.drain(..start);
         }
     }
     fn send(&mut self, c: Command) -> bool {
@@ -137,6 +199,11 @@ impl App {
                 Event::Failed(e) => {
                     self.worker = None;
                     self.connected = false;
+                    if self.console_shared {
+                        self.console_shared = false;
+                        self.console_connected = false;
+                        self.console_status = "Modbus link failed; console disconnected".into();
+                    }
                     self.note(format!("Connection failed: {e}"));
                 }
                 Event::Snapshot(v, time) => {
@@ -158,6 +225,31 @@ impl App {
                             "Write failed: {e}. Outcome may be unknown; refresh before retry."
                         )),
                     }
+                }
+                Event::ConsoleResult(result) => match result {
+                    Ok(bytes) => self.append_console_output(&bytes),
+                    Err(error) => self.console_status = format!("Text CLI: {error}"),
+                },
+            }
+        }
+        let console_events: Vec<_> = self
+            .console
+            .as_ref()
+            .map(|c| c.events.try_iter().collect())
+            .unwrap_or_default();
+        for event in console_events {
+            match event {
+                ConsoleEvent::Connected => {
+                    self.console_connected = true;
+                    self.console_status = "Connected".into();
+                }
+                ConsoleEvent::Output(bytes) => {
+                    self.append_console_output(&bytes);
+                }
+                ConsoleEvent::Failed(error) => {
+                    self.console = None;
+                    self.console_connected = false;
+                    self.console_status = format!("Console error: {error}");
                 }
             }
         }
@@ -264,6 +356,82 @@ impl App {
                     }
                     self.dialog = Some(Dialog::Settings { fields, active });
                 }
+                Dialog::ConsoleSettings {
+                    mut fields,
+                    mut active,
+                } => {
+                    match key.code {
+                        KeyCode::Tab | KeyCode::Down => active = (active + 1) % 2,
+                        KeyCode::BackTab | KeyCode::Up => active = (active + 1) % 2,
+                        KeyCode::Enter => {
+                            let baud = fields[1].parse::<u32>().ok();
+                            if fields[0].trim().is_empty() {
+                                self.console_status = "Enter a console port".into();
+                            } else if !matches!(baud, Some(9600 | 115200)) {
+                                self.console_status = "Console baud must be 9600 or 115200".into();
+                            } else {
+                                self.console_port = fields[0].trim().into();
+                                self.console_baud = baud.unwrap();
+                                self.console_status = "Settings saved; F3 opens console".into();
+                                return;
+                            }
+                        }
+                        _ => edit_text(&mut fields[active], key),
+                    }
+                    self.dialog = Some(Dialog::ConsoleSettings { fields, active });
+                }
+            }
+            return;
+        }
+        if self.tab == 4 {
+            match key.code {
+                KeyCode::Tab | KeyCode::Right => {
+                    self.tab = 0;
+                    self.state = TableState::default().with_selected(0);
+                }
+                KeyCode::BackTab | KeyCode::Left => {
+                    self.tab = 3;
+                    self.state = TableState::default().with_selected(0);
+                }
+                KeyCode::F(2) if self.console.is_none() => {
+                    self.dialog = Some(Dialog::ConsoleSettings {
+                        fields: [self.console_port.clone(), self.console_baud.to_string()],
+                        active: 0,
+                    });
+                }
+                KeyCode::F(3) => self.connect_console(),
+                KeyCode::F(4) => self.console_output.clear(),
+                KeyCode::Enter => {
+                    if self.console_shared && self.console_connected {
+                        let command = self.console_input.clone();
+                        if command.len() > 63
+                            || !command
+                                .bytes()
+                                .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+                        {
+                            self.console_status =
+                                "Use at most 63 printable ASCII characters".into();
+                        } else if self.send(Command::Console(command)) {
+                            self.console_input.clear();
+                        }
+                    } else if let Some(console) =
+                        self.console.as_ref().filter(|_| self.console_connected)
+                    {
+                        match console.send(&self.console_input) {
+                            Ok(()) => self.console_input.clear(),
+                            Err(error) => self.console_status = error,
+                        }
+                    } else {
+                        self.console_status = "Open the console with F3 first".into();
+                    }
+                }
+                _ => {
+                    if self.console_input.len() < 63
+                        || matches!(key.code, KeyCode::Backspace | KeyCode::Char('u'))
+                    {
+                        edit_text(&mut self.console_input, key);
+                    }
+                }
             }
             return;
         }
@@ -287,14 +455,14 @@ impl App {
             }
             KeyCode::Char('l') => self.dialog = Some(Dialog::Log),
             KeyCode::Tab | KeyCode::Right => {
-                self.tab = (self.tab + 1) % 4;
+                self.tab = (self.tab + 1) % 5;
                 self.state = TableState::default().with_selected(0);
             }
             KeyCode::BackTab | KeyCode::Left => {
-                self.tab = (self.tab + 3) % 4;
+                self.tab = (self.tab + 4) % 5;
                 self.state = TableState::default().with_selected(0);
             }
-            KeyCode::Char('1'..='4') => {
+            KeyCode::Char('1'..='5') => {
                 if let KeyCode::Char(c) = key.code {
                     self.tab = (c as u8 - b'1') as usize;
                     self.state = TableState::default().with_selected(0);
@@ -359,94 +527,130 @@ impl App {
             panels[0],
         );
         f.render_widget(
-            Tabs::new(BANKS.map(|b| b.label()))
-                .select(self.tab)
-                .highlight_style(
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .block(Block::bordered().title(" Tables  [Tab / ← → / 1–4] ")),
+            Tabs::new([
+                "Telemetry",
+                "Settings & identity",
+                "Coils",
+                "Discrete inputs",
+                "Text console",
+            ])
+            .select(self.tab)
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(Block::bordered().title(" Tabs  [Tab / ← → / 1–5] ")),
             panels[1],
         );
-        let indices = self.indices();
-        let data = indices.iter().map(|&i| {
+        if self.tab == 4 {
+            let lines: Vec<&str> = self.console_output.lines().collect();
+            let visible = panels[2].height.saturating_sub(2) as usize;
+            let start = lines.len().saturating_sub(visible);
+            f.render_widget(
+                Paragraph::new(lines[start..].join("\n"))
+                    .wrap(Wrap { trim: false })
+                    .block(Block::bordered().title(format!(
+                        " Text CLI · {} · {} baud · {} ",
+                        self.console_port, self.console_baud, self.console_status
+                    ))),
+                panels[2],
+            );
+            f.render_widget(
+                Paragraph::new(format!("> {}▏", self.console_input))
+                    .block(Block::bordered().title(" Command · Enter sends ")),
+                panels[3],
+            );
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::from("F2 settings  F3 open/close  F4 clear  Ctrl-U clear input"),
+                    Line::from("Tab switches views; Modbus polling continues in the background."),
+                ])
+                .block(Block::bordered().title(" Console controls ")),
+                panels[4],
+            );
+        } else {
+            let indices = self.indices();
+            let data = indices.iter().map(|&i| {
+                let r = &self.rows[i];
+                let (value, raw) = match &self.values[i] {
+                    Ok(v) => (
+                        format!("{} {}", r.display(v), r.unit),
+                        v.iter()
+                            .map(|w| format!("{w:04X}"))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ),
+                    Err(_) => ("Unavailable".into(), "—".into()),
+                };
+                let address = if r.count == 2 {
+                    format!("{:05}–{:05}", r.address, r.address + 1)
+                } else {
+                    format!("{:05}", r.address)
+                };
+                Row::new(vec![
+                    address,
+                    r.name.to_string(),
+                    value,
+                    raw,
+                    if r.writable() { "R/W" } else { "R" }.into(),
+                ])
+            });
+            let table = Table::new(
+                data,
+                [
+                    Constraint::Length(12),
+                    Constraint::Percentage(32),
+                    Constraint::Min(20),
+                    Constraint::Length(10),
+                    Constraint::Length(4),
+                ],
+            )
+            .header(
+                Row::new(["Address", "Parameter", "Current value", "Raw hex", "Mode"])
+                    .style(Style::default().fg(Color::Yellow))
+                    .bottom_margin(1),
+            )
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ")
+            .block(
+                Block::bordered().title(" Live values · Enter/e to edit · writes require review "),
+            );
+            f.render_stateful_widget(table, panels[2], &mut self.state);
+            let i = self.selected();
             let r = &self.rows[i];
-            let (value, raw) = match &self.values[i] {
-                Ok(v) => (
-                    format!("{} {}", r.display(v), r.unit),
-                    v.iter()
-                        .map(|w| format!("{w:04X}"))
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                ),
-                Err(_) => ("Unavailable".into(), "—".into()),
+            let detail = match &self.values[i] {
+                Ok(_) => r.hint.to_string(),
+                Err(e) => format!("{} | {e}", r.hint),
             };
-            let address = if r.count == 2 {
-                format!("{:05}–{:05}", r.address, r.address + 1)
-            } else {
-                format!("{:05}", r.address)
-            };
-            Row::new(vec![
-                address,
-                r.name.to_string(),
-                value,
-                raw,
-                if r.writable() { "R/W" } else { "R" }.into(),
-            ])
-        });
-        let table = Table::new(
-            data,
-            [
-                Constraint::Length(12),
-                Constraint::Percentage(32),
-                Constraint::Min(20),
-                Constraint::Length(10),
-                Constraint::Length(4),
-            ],
-        )
-        .header(
-            Row::new(["Address", "Parameter", "Current value", "Raw hex", "Mode"])
-                .style(Style::default().fg(Color::Yellow))
-                .bottom_margin(1),
-        )
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ")
-        .block(Block::bordered().title(" Live values · Enter/e to edit · writes require review "));
-        f.render_stateful_widget(table, panels[2], &mut self.state);
-        let i = self.selected();
-        let r = &self.rows[i];
-        let detail = match &self.values[i] {
-            Ok(_) => r.hint.to_string(),
-            Err(e) => format!("{} | {e}", r.hint),
-        };
-        f.render_widget(
-            Paragraph::new(detail)
+            f.render_widget(
+                Paragraph::new(detail)
+                    .wrap(Wrap { trim: true })
+                    .block(Block::bordered().title(format!(" {} ", r.name))),
+                panels[3],
+            );
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::from(self.message.as_str()),
+                    Line::from(Span::styled(
+                        "c link  s settings  ↑↓ select  e edit  r refresh  t clock  l log  q quit",
+                        Style::default().fg(Color::Cyan),
+                    )),
+                ])
                 .wrap(Wrap { trim: true })
-                .block(Block::bordered().title(format!(" {} ", r.name))),
-            panels[3],
-        );
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::from(self.message.as_str()),
-                Line::from(Span::styled(
-                    "c link  s settings  ↑↓ select  e edit  r refresh  t clock  l log  q quit",
-                    Style::default().fg(Color::Cyan),
-                )),
-            ])
-            .wrap(Wrap { trim: true })
-            .block(Block::bordered().title(if self.writing {
-                " Write pending "
-            } else {
-                " Status "
-            })),
-            panels[4],
-        );
+                .block(Block::bordered().title(if self.writing {
+                    " Write pending "
+                } else {
+                    " Status "
+                })),
+                panels[4],
+            );
+        }
         if let Some(dialog) = &self.dialog {
             let rect = centered(area, 78, 15);
             f.render_widget(Clear, rect);
@@ -498,6 +702,27 @@ impl App {
                         "Tab / ↑↓ field · Ctrl-U clear · Enter save · Esc cancel".into(),
                     ]);
                     (" Connection settings ", lines)
+                }
+                Dialog::ConsoleSettings { fields, active } => {
+                    let mut lines = vec![
+                        "UART0 RS232: 115200. Local PE3/PE4 console: 9600.".into(),
+                        "Use the Modbus port to share UART0, or another port for the local console.".into(),
+                        String::new(),
+                    ];
+                    for (i, name) in ["Port", "Baud"].iter().enumerate() {
+                        lines.push(format!(
+                            "{} {name:12} {}{}",
+                            if i == *active { "▶" } else { " " },
+                            fields[i],
+                            if i == *active { "▏" } else { "" }
+                        ));
+                    }
+                    lines.extend([
+                        String::new(),
+                        self.console_status.clone(),
+                        "Tab / ↑↓ field · Ctrl-U clear · Enter save · Esc cancel".into(),
+                    ]);
+                    (" Text console settings ", lines)
                 }
                 Dialog::Log => (
                     " Recent activity · Esc closes ",
@@ -604,6 +829,9 @@ mod tests {
             app.tab = tab;
             terminal.draw(|f| app.draw(f)).unwrap();
         }
+        app.tab = 4;
+        terminal.draw(|f| app.draw(f)).unwrap();
+        app.tab = 0;
         for dialog in [
             Dialog::Edit {
                 index: 0,
@@ -620,6 +848,10 @@ mod tests {
                     "1".into(),
                     "500".into(),
                 ],
+                active: 0,
+            },
+            Dialog::ConsoleSettings {
+                fields: ["/dev/test".into(), "115200".into()],
                 active: 0,
             },
             Dialog::Log,
@@ -673,5 +905,23 @@ mod tests {
         assert!(app.dialog.is_none());
         app.key(key(KeyCode::Char('q')));
         assert!(app.quit);
+    }
+
+    #[test]
+    fn console_tab_accepts_command_text_without_triggering_modbus_shortcuts() {
+        let mut app = app();
+        app.tab = 4;
+        for c in "status".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.console_input, "status");
+        assert!(!app.quit);
+        assert!(app.worker.is_none());
+        app.key(key(KeyCode::Tab));
+        assert_eq!(app.tab, 0);
+        app.key(key(KeyCode::BackTab));
+        assert_eq!(app.tab, 4);
+        app.key(key(KeyCode::F(2)));
+        assert!(matches!(app.dialog, Some(Dialog::ConsoleSettings { .. })));
     }
 }

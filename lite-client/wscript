@@ -1,0 +1,142 @@
+#!/usr/bin/env python
+# encoding: utf-8
+# Copyright (c) 2013-2017 GomSpace A/S. All rights reserved.
+
+import os
+import time
+import gs_doc
+import gs_gcc
+import gs_util
+import gs_dist
+import gs.buildtools.util
+from waflib.Build import BuildContext
+
+APPNAME = 'csp-client'
+VERSION = '2.1.1'
+
+
+def options(ctx):
+    ctx.load('gs_gcc gs_doc')
+    gs_gcc.gs_recurse(ctx)
+
+    gr = ctx.add_option_group("CSP-CLIENT options")
+    ctx.add_option('--build-disable', action='store', default='stlib,shlib', help='Disable build of .a/.so libs')
+
+
+def configure(ctx):
+    ctx.load('gs_gcc gs_doc')
+
+    ctx.gs_get_build_info('DEFINES', appName=APPNAME, tag=VERSION)
+
+    # Options for libgscsp/libcsp
+    ctx.options.enable_rdp = True
+    ctx.options.enable_qos = True
+    ctx.options.enable_crc32 = True
+    ctx.options.enable_hmac = True
+    ctx.options.enable_xtea = True
+    ctx.options.enable_promisc = True
+    ctx.options.enable_if_kiss = True
+    ctx.options.enable_if_can = True
+    ctx.options.enable_if_i2c = True
+    # Keep this client independent of libzmq; it is not needed for DAL CSP.
+    ctx.options.enable_if_zmqhub = False
+    # The Windows-hosted build uses the fixed route table; Linux keeps CIDR routes.
+    ctx.options.with_rtable = 'static' if os.name == 'nt' else 'cidr'
+    # SocketCAN is a Linux-only backend. Keep it enabled on Linux, but avoid
+    # compiling/linking it with the native Windows/MinGW toolchain.
+    ctx.options.enable_can_socketcan = (os.name != 'nt')
+    ctx.options.with_router_queue_length = 100
+    ctx.options.with_conn_queue_length = 100
+
+    # Options for clients
+    ctx.options.gssb_twi_handler = 0
+    ctx.options.gssb_enable_istage = True
+    ctx.options.gssb_enable_msp = True
+    ctx.options.gssb_enable_sunsensor = True
+    ctx.options.gssb_enable_ar6 = True
+    ctx.options.gssb_enable_ant6 = True
+    ctx.options.gssb_enable_i4 = True
+    ctx.options.enable_nanopower2_client = True
+    ctx.options.enable_bpx_client = True
+
+    gs_gcc.gs_recurse(ctx)
+    ctx.env.append_value('CFLAGS', '-fcommon')
+
+
+# Libraries needed by csp-client-lite: rparam, rgosh and the default CSP
+# commands only - no FTP, G-script, HK, GSSB, ADCS/AX100/P60*/EPS/BPX/
+# GATOSS/NanoCam/z7000 product interfaces, and no Aardvark (USB I2C/SPI
+# dongle) support.
+LITE_APPNAME = 'csp-client-lite'
+LITE_LIBS = ['param_client', 'rgosh_client', 'gscsp', 'util', 'nanopb']
+LITE_OBJ_GLOBS = ['lib/libparam_client/obj/**/*.o',
+                  'lib/librgosh_client/obj/**/*.o',
+                  'lib/libgscsp/obj/**/*.o',
+                  'lib/libutil/obj/**/*.o',
+                  'lib/libnanopb/obj/**/*.o']
+
+
+def build(ctx):
+    gs_gcc.gs_recurse(ctx)
+
+    use = [t.name for t in ctx.get_all_task_gen() if hasattr(t, 'typ') and t.typ == 'objects']
+
+    for obj in ctx.path.ant_glob('lib/**/obj/**/*.o'):
+        ctx.env.append_unique('LINKFLAGS_CSPCLIENT', '../' + obj.relpath())
+
+    ctx.program(source=ctx.path.ant_glob('src/*.c', excl=['src/main_lite.c']),
+                target=APPNAME,
+                linkflags=ctx.env.LINKFLAGS_CSPCLIENT,
+                use=use,
+                lib=ctx.env.LIBS + ['m', 'dl', 'rt', 'pthread'])
+    # The lite client does not use the optional Aardvark dongle library.
+
+    lite_use = [name for name in use if name in LITE_LIBS]
+
+    for obj in ctx.path.ant_glob(LITE_OBJ_GLOBS):
+        ctx.env.append_unique('LINKFLAGS_CSPCLIENTLITE', '../' + obj.relpath())
+
+    ctx.program(source=ctx.path.ant_glob('src/main_lite.c'),
+                target=LITE_APPNAME,
+                linkflags=ctx.env.LINKFLAGS_CSPCLIENTLITE,
+                use=lite_use,
+                lib=ctx.env.LIBS + ['m', 'dl', 'rt', 'pthread'])
+
+
+class BuildLite(BuildContext):
+    """
+    Build only csp-client-lite (equivalent to 'waf build --targets=csp-client-lite').
+    Skips compiling every library csp-client-lite doesn't use (FTP, G-script, HK,
+    GSSB, ADCS, product interfaces, Aardvark, ...), so it's much faster than 'build'.
+    Usage: ./waf configure build_lite
+    """
+    cmd = 'build_lite'
+    fun = 'build'
+
+    def __init__(self, **kw):
+        super(BuildLite, self).__init__(**kw)
+        self.targets = LITE_APPNAME
+
+
+def doc(ctx):
+    gs_doc.gs_sdk_manual_doc(ctx, doxygen=True, keyvalues={
+        'gs_prod_group': 'NanoSoft',
+        'gs_prod_name': 'Product Interface Application',
+        'gs_prod_desc': 'Software Development Kit',
+        'gs_sphinx_exclude': [],
+        'gs_sphinx_tags': []
+    })
+
+
+class Doc(BuildContext):
+    cmd = fun = 'doc'
+
+
+def gs_dist(ctx):
+    ctx.set_appname('gs-sw-nanosoft-product-interface-application')
+    ctx.recurse('tools/buildtools')
+    gs_gcc.gs_recurse(ctx)
+    ctx.add_default_files(source_module=True)
+    ctx.add_file_to_dir(ctx.path.ant_glob('artifacts/*.pdf'), 'doc')
+    ctx.add_file_on_path('artifacts/html', 'doc/html')
+    ctx.add_file_to_dir('artifacts/manifest.json', "")

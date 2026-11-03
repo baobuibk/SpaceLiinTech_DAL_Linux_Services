@@ -1,0 +1,19 @@
+[Unit]
+Description=Temperature Sensor Service (TC1047A + NTC)
+After=sysinit.target local-fs.target
+DefaultDependencies=no
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+RuntimeDirectory=dal/temp
+ExecStart=/home/root/tools/bin/temp_service
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+

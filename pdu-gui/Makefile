@@ -11,5 +11,5 @@ target:
 
 # Stage the ARM executable for transfer to the board.
 deploy: target
-	install -d ../deploy
-	install -m 0755 target/armv7-unknown-linux-gnueabihf/release/dal-pdu-gui ../deploy/dal-pdu-gui
+	install -d ../deploy/dal_pdu
+	install -m 0755 target/armv7-unknown-linux-gnueabihf/release/dal-pdu-gui ../deploy/dal_pdu/dal-pdu-gui

@@ -1,0 +1,9 @@
+[Release]
+
+[11/08]
+- Fixed : CRC16 now calc on payload only
+- Added : dat_del (TYPE=0x03, ADDR=0x04) implemented
+- Added : dat_mark (TYPE=0x03, ADDR=0x05) implemented.
+- Fixed : added send_debug_ack() sending ACK/ERR=0xFE
+- Added : debug shell (TYPE=0xFF, ADDR=0x01) implemented
+- Added : dat_lst optional mark filter. TC payload now optional: LENGTH=0 -> no filter LENGTH=1 payload=Mark Filter(U8) -> 0xFF=all, 0x00=unmarked only, 0x01-0xFE= specific mark.

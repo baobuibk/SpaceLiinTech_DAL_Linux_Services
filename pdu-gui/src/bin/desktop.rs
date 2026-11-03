@@ -1,4 +1,5 @@
 use dal_pdu_gui::{
+    console::{same_port, Console, Event as ConsoleEvent},
     map::{self, Bank, Row},
     rtu::Client,
     worker::{Command, Config, Event, Worker},
@@ -24,6 +25,15 @@ struct App {
     log: VecDeque<String>,
     pending: Option<(usize, String)>,
     writing: bool,
+    console: Option<Console>,
+    console_connected: bool,
+    console_shared: bool,
+    console_port: String,
+    console_baud: u32,
+    console_input: String,
+    console_output: String,
+    console_status: String,
+    console_view: bool,
 }
 impl Default for App {
     fn default() -> Self {
@@ -32,6 +42,8 @@ impl Default for App {
             config: Config {
                 port: if cfg!(windows) {
                     "COM3"
+                } else if cfg!(all(target_os = "linux", target_arch = "arm")) {
+                    "/dev/ttyS3"
                 } else {
                     "/dev/ttyUSB0"
                 }
@@ -53,6 +65,22 @@ impl Default for App {
             log: VecDeque::new(),
             pending: None,
             writing: false,
+            console: None,
+            console_connected: false,
+            console_shared: false,
+            console_port: if cfg!(windows) {
+                "COM3"
+            } else if cfg!(all(target_os = "linux", target_arch = "arm")) {
+                "/dev/ttyS3"
+            } else {
+                "/dev/ttyUSB0"
+            }
+            .into(),
+            console_baud: 115200,
+            console_input: String::new(),
+            console_output: String::new(),
+            console_status: "Disconnected".into(),
+            console_view: false,
         }
     }
 }
@@ -61,6 +89,17 @@ impl App {
         self.message = text.clone();
         self.log.push_front(text);
         self.log.truncate(50);
+    }
+    fn append_console_output(&mut self, bytes: &[u8]) {
+        self.console_output
+            .push_str(&String::from_utf8_lossy(bytes).replace('\r', ""));
+        if self.console_output.len() > 65536 {
+            let mut start = self.console_output.len() - 65536;
+            while !self.console_output.is_char_boundary(start) {
+                start += 1;
+            }
+            self.console_output.drain(..start);
+        }
     }
     fn send(&mut self, command: Command) -> bool {
         if let Some(worker) = &self.worker {
@@ -86,6 +125,11 @@ impl App {
                 Event::Failed(e) => {
                     self.worker = None;
                     self.connected = false;
+                    if self.console_shared {
+                        self.console_shared = false;
+                        self.console_connected = false;
+                        self.console_status = "Modbus link failed; console disconnected".into();
+                    }
                     self.note(format!("Connection failed: {e}"));
                 }
                 Event::Snapshot(values, started) => {
@@ -107,8 +151,126 @@ impl App {
                         Err(e) => self.note(format!("{}: write failed ({e}). Outcome may be unknown; inspect refreshed value before retrying.", self.rows[index].name)),
                     }
                 }
+                Event::ConsoleResult(result) => match result {
+                    Ok(bytes) => self.append_console_output(&bytes),
+                    Err(error) => self.console_status = format!("Text CLI: {error}"),
+                },
             }
         }
+        let console_events: Vec<_> = self
+            .console
+            .as_ref()
+            .map(|c| c.events.try_iter().collect())
+            .unwrap_or_default();
+        for event in console_events {
+            match event {
+                ConsoleEvent::Connected => {
+                    self.console_connected = true;
+                    self.console_status = "Connected".into();
+                }
+                ConsoleEvent::Output(bytes) => self.append_console_output(&bytes),
+                ConsoleEvent::Failed(error) => {
+                    self.console = None;
+                    self.console_connected = false;
+                    self.console_status = format!("Console error: {error}");
+                }
+            }
+        }
+    }
+    fn console_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(self.console.is_none() && !self.console_shared, |ui| {
+                ui.label("Console port");
+                ui.add(egui::TextEdit::singleline(&mut self.console_port).desired_width(180.0));
+                ui.label("Baud");
+                egui::ComboBox::from_id_salt("console_baud")
+                    .selected_text(self.console_baud.to_string())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.console_baud, 115200, "115200 · UART0 RS232");
+                        ui.selectable_value(&mut self.console_baud, 9600, "9600 · local PE3/PE4");
+                    });
+            });
+            if self.console.is_none() && !self.console_shared {
+                if ui.button("Open console").clicked() {
+                    if self.console_port.trim().is_empty() {
+                        self.console_status = "Enter a console port".into();
+                    } else if self.worker.is_some()
+                        && same_port(&self.console_port, &self.config.port)
+                    {
+                        if self.console_baud != self.config.baud {
+                            self.console_status = "Shared port must use the Modbus baud".into();
+                        } else if self.connected {
+                            self.console_shared = true;
+                            self.console_connected = true;
+                            self.console_status = "Attached to Modbus UART0 link".into();
+                        } else {
+                            self.console_status =
+                                "Wait for Modbus connection before attaching".into();
+                        }
+                    } else {
+                        self.console =
+                            Some(Console::start(self.console_port.clone(), self.console_baud));
+                        self.console_status = "Opening console…".into();
+                    }
+                }
+            } else if ui.button("Close console").clicked() {
+                self.console = None;
+                self.console_shared = false;
+                self.console_connected = false;
+                self.console_status = "Disconnected".into();
+            }
+            if ui.button("Clear output").clicked() {
+                self.console_output.clear();
+            }
+        });
+        ui.small("Text CLI: UART0 RS232 at 115200, or local PE3/PE4 console at 9600. Commands are sent with Enter.");
+        ui.label(&self.console_status);
+        ui.separator();
+        let output_height = (ui.available_height() - 40.0).max(80.0);
+        let output_rows = (output_height / 18.0).max(4.0) as usize;
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .auto_shrink([false, false])
+            .max_height(output_height)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.console_output)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(output_rows)
+                        .interactive(false),
+                );
+            });
+        ui.horizontal(|ui| {
+            ui.label(">");
+            let response = ui.add_enabled(
+                self.console_connected,
+                egui::TextEdit::singleline(&mut self.console_input).desired_width(f32::INFINITY),
+            );
+            let submit =
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if submit
+                || ui
+                    .add_enabled(self.console_connected, egui::Button::new("Send"))
+                    .clicked()
+            {
+                if self.console_shared {
+                    let command = self.console_input.clone();
+                    if command.len() > 63
+                        || !command.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+                    {
+                        self.console_status = "Use at most 63 printable ASCII characters".into();
+                    } else if self.send(Command::Console(command)) {
+                        self.console_input.clear();
+                    }
+                } else if let Some(console) = &self.console {
+                    match console.send(&self.console_input) {
+                        Ok(()) => self.console_input.clear(),
+                        Err(error) => self.console_status = error,
+                    }
+                }
+            }
+        });
     }
     fn content(&mut self, ctx: &egui::Context) {
         self.receive();
@@ -136,11 +298,16 @@ impl App {
                 });
                 if self.worker.is_none() {
                     if ui.button("Connect").clicked() {
-                        self.values.fill(Err("Waiting for first read".into())); self.edits.fill(String::new()); self.last_update = None;
-                        self.worker = Some(Worker::start(self.config.clone())); self.note("Opening serial port…".into());
+                        if self.console.is_some() && same_port(&self.console_port, &self.config.port) {
+                            self.note("Close the console before opening Modbus on the same port".into());
+                        } else {
+                            self.values.fill(Err("Waiting for first read".into())); self.edits.fill(String::new()); self.last_update = None;
+                            self.worker = Some(Worker::start(self.config.clone())); self.note("Opening serial port…".into());
+                        }
                     }
                 } else if ui.button("Disconnect").clicked() {
                     self.worker = None; self.connected = false; self.writing = false; self.pending = None;
+                    if self.console_shared { self.console_shared = false; self.console_connected = false; self.console_status = "Modbus link closed; console disconnected".into(); }
                     self.values.fill(Err("Disconnected".into())); self.last_update = None; self.note("Disconnected".into());
                 }
                 if ui.add_enabled(self.connected, egui::Button::new("Refresh")).clicked() { self.send(Command::Refresh); }
@@ -176,6 +343,15 @@ impl App {
             });
         });
         egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.console_view, false, "Registers");
+                ui.selectable_value(&mut self.console_view, true, "Text console");
+            });
+            ui.separator();
+            if self.console_view {
+                self.console_ui(ui);
+                return;
+            }
             ui.horizontal(|ui| {
                 for bank in [Bank::Input, Bank::Holding, Bank::Coil, Bank::Discrete] { ui.selectable_value(&mut self.bank, bank, bank.label()); }
                 ui.separator(); ui.label("Filter"); ui.text_edit_singleline(&mut self.filter);
@@ -311,6 +487,10 @@ mod tests {
             let output = ctx.run(egui::RawInput::default(), |ctx| app.content(ctx));
             assert!(!output.shapes.is_empty());
         }
+        app.console_view = true;
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.content(ctx));
+        assert!(!output.shapes.is_empty());
+        app.console_view = false;
         app.pending = Some((0, "1".into()));
         let output = ctx.run(egui::RawInput::default(), |ctx| app.content(ctx));
         assert!(!output.shapes.is_empty());

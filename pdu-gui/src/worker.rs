@@ -22,12 +22,14 @@ pub struct Config {
 pub enum Command {
     Refresh,
     Write(usize, String),
+    Console(String),
 }
 pub enum Event {
     Connected,
     Failed(String),
     Snapshot(Vec<Result<Vec<u16>, String>>, Instant),
     WriteResult(usize, Result<(), String>),
+    ConsoleResult(Result<Vec<u8>, String>),
 }
 pub struct Worker {
     pub commands: SyncSender<Command>,
@@ -69,6 +71,11 @@ impl Worker {
                     }
                     match command {
                         Command::Refresh => refresh = true,
+                        Command::Console(text) => {
+                            let result = client.text_command(&text);
+                            let _ = events.send(Event::ConsoleResult(result));
+                            refresh = true;
+                        }
                         Command::Write(index, text) => {
                             let result = rows
                                 .get(index)

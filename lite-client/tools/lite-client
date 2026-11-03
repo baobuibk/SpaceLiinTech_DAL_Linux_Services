@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Thin single-shot wrapper around csp-client-lite.
+#
+# Routes a bare verb to the right command group so you don't have to type
+# 'rparam'/'rgosh' every time, then runs the binary once and exits - e.g.:
+#
+#   lite-client -c=can1 ping 12
+#   lite-client -c=can1 getall 12 4
+#   lite-client -c=can1 get bme_temp
+#   lite-client -c=can1 rparam get bme_temp   # explicit form still works
+#
+# Expects csp-client-lite to sit next to this script (as it does in build/
+# after './waf build'), or on PATH.
+set -eu
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -x "$script_dir/csp-client-lite" ]; then
+    bin="$script_dir/csp-client-lite"
+else
+    bin="csp-client-lite"
+fi
+
+print_help() {
+    cat <<'EOF'
+usage: lite-client [csp-client-lite options] <verb> [args...]
+
+Runs one command against csp-client-lite and exits (one-shot mode) - no need
+to enter the interactive console. Options (e.g. -c=can1) must come first.
+
+Verbs are routed automatically, so you don't have to type 'rparam'/'rgosh':
+  ping|rps|memfree|buffree|reboot|shutdown|uptime|cmp|route|ifc|conn|rdpopt
+        -> passed straight through (default CSP commands)
+  init|download|getall|getval|setval|list|get|set|copy|load|save|reset|send|
+  wd|timeout|checksum|autosend
+        -> routed to 'rparam <verb> ...'
+  run|server
+        -> routed to 'rgosh <verb> ...'
+  anything else (e.g. 'rparam get ...', 'help', 'help rparam getall')
+        -> passed through as-is
+
+Shortcuts for one-shot / scripted use (each is fully self-contained: no state
+from a previous call is needed, since every invocation is a fresh process):
+  getall [node] [table-id]                   download spec (if given) then read the whole table
+  getval <node> <table-id> <parameter>       download spec, get, and send in one call
+  setval <node> <table-id> <parameter> <value> [value...]
+                                              download spec, set, and send in one call
+  run [node] <command>                       rgosh: set the server (if given) then run
+
+Note: plain 'get'/'set' only work after 'download'/'init' in the *same*
+process (i.e. inside the interactive console) - use 'getval'/'setval' instead
+when scripting one-shot calls.
+
+Examples:
+  lite-client -c=can1 ping 12
+  lite-client -c=can1 getall 12 4
+  lite-client -c=can1 getval 12 4 bme_temp
+  lite-client -c=can1 setval 11 4 ft_chunk_size 512
+  lite-client -c=can1 run 12 "ntc_read_all"
+  lite-client -c=can1 help                 # full command list from csp-client-lite
+  lite-client -c=can1 help rparam setval   # usage for a specific (sub)command
+EOF
+}
+
+case "${1:-}" in
+    -h|--help)
+        print_help
+        exit 0
+        ;;
+esac
+
+opts=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -*) opts+=("$1"); shift ;;
+        *) break ;;
+    esac
+done
+
+if [ $# -eq 0 ]; then
+    print_help >&2
+    exit 1
+fi
+
+verb="$1"
+shift
+
+case "$verb" in
+    # default CSP commands - already top-level, pass through unchanged
+    ping|rps|memfree|buffree|reboot|shutdown|uptime|cmp|route|ifc|conn|rdpopt)
+        exec "$bin" "${opts[@]}" "$verb" "$@"
+        ;;
+    # rparam sub-commands
+    init|download|getall|getval|setval|list|get|set|copy|load|save|reset|send|wd|timeout|checksum|autosend)
+        exec "$bin" "${opts[@]}" rparam "$verb" "$@"
+        ;;
+    # rgosh sub-commands
+    run|server)
+        exec "$bin" "${opts[@]}" rgosh "$verb" "$@"
+        ;;
+    # already fully qualified, or anything else - pass through as-is
+    *)
+        exec "$bin" "${opts[@]}" "$verb" "$@"
+        ;;
+esac

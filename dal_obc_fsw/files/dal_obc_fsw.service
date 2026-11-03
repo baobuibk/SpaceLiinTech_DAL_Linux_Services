@@ -1,0 +1,18 @@
+[Unit]
+Description=BEE-DAL OBC flight software
+After=systemd-timesyncd.service temp.service bme.service startup.service
+Wants=network.target temp.service bme.service
+
+[Service]
+Type=simple
+RuntimeDirectory=dal/dal_obc_fsw
+ExecStartPre=/bin/mkdir -p /home/root/tmp/run/dal_obc_fsw
+ExecStartPre=/bin/mkdir -p /home/root/var/dal_obc_fsw
+ExecStart=/home/root/tools/bin/dal_obc_fsw
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/home/root
+EnvironmentFile=-/etc/default/dal-obc-fsw
+
+[Install]
+WantedBy=multi-user.target

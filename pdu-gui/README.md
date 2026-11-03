@@ -36,6 +36,16 @@ cargo run --locked --features desktop --bin dal-pdu-desktop
 Only this optional binary needs X11/Wayland/OpenGL on Linux. The default build
 excludes eframe/winit and their graphical dependencies.
 
+The desktop interface has a **Text console** tab for the firmware's interactive
+text CLI. Set the console's serial port and choose **115200** for UART0 RS232 or
+**9600** for the local PE3/PE4 software console, then click **Open console**.
+Type a firmware command such as `help` and press Enter or click Send. The output
+panel shows the firmware's echo, replies, and prompt. Close the console to
+release its port. To share UART0 with Modbus, connect Modbus first and use the
+same device path in the text console tab. Commands are serialized through one
+serial connection. Separate physical serial links can also be used at the
+same time.
+
 ## Build for the real OBC target
 
 The build wrapper loads the SDK from `/home/buildmachine/oecore-obcv110` and
@@ -49,7 +59,7 @@ cd service/pdu-gui
 rustup target add armv7-unknown-linux-gnueabihf
 make target                 # equivalent: ./build.sh target
 make host                   # equivalent: ./build.sh host
-make deploy                 # build ARM executable and copy to ../deploy/dal-pdu-gui
+make deploy                 # build ARM executable and copy to ../deploy/dal_pdu/dal-pdu-gui
 ```
 
 Target executable:
@@ -64,9 +74,15 @@ To use another installation of the same SDK:
 PDU_SDK_ROOT=/path/to/oecore-obcv110 make target
 ```
 
-`make deploy` creates `service/deploy/` if needed and stages the ARM executable
-there as `dal-pdu-gui` with executable permissions, replacing any previous copy.
+`make deploy` creates `service/deploy/dal_pdu/` if needed and stages the ARM
+executable there as `dal-pdu-gui` with executable permissions, replacing any
+previous copy at that path.
 The staged binary is ignored by Git. It does not copy anything to a remote board.
+
+The top-level `make -C service deploy` also stages this executable. After
+copying `service/deploy` to `/home/root/deploy` on the OBC, run
+`make -C /home/root/deploy install` as root. The installer puts the terminal
+application at `/home/root/tools/bin/dal-pdu-gui`.
 
 Copy the ARM executable to the board using your usual deployment workflow,
 then run it from the serial console or an SSH session with a terminal allocated.
@@ -76,21 +92,24 @@ execution on physical hardware remains untested.
 
 ## Connect and navigate
 
-1. On the DAL OBC, connect the PDU to the PC/104 RS-485 bus and select
-   `/dev/ttyS2`. The board's PE5 direction pin is driven by FLEXCOM0 RTS in
-   kernel RS-485 mode; the application does not toggle it. For a USB connection,
-   use an automatic-direction USB–RS485 adapter. RS-232 requires a USB–RS232
-   adapter or the matching onboard RS-232 port. Do not use a bare TTL adapter.
-2. Press **s** for settings. Edit the port (`/dev/ttyUSB0`, a `/dev/serial/by-id/`
+1. On the DAL OBC, connect the PDU USART0 RS-232 interface to PC/104
+   RS232_1 (`/dev/ttyS3`). This is the ARM build's default port at 115200 baud.
+   For the PDU RS-485 interface, select `/dev/ttyS2`; the board's PE5
+   direction pin is driven by FLEXCOM0 RTS in kernel RS-485 mode. The
+   application does not toggle it. USB adapters require the matching RS-232
+   or automatic-direction RS-485 electrical interface. Do not use a bare TTL adapter.
+2. Press **s** for settings. Edit the port (`/dev/ttyS3`, `/dev/ttyUSB0`, a `/dev/serial/by-id/`
    path, or `COM3`), baud, slave, and timeout. **Tab** changes fields; **Ctrl-U**
    clears the active field; **Enter** saves; **Esc** cancels.
 3. Press **c** to connect/disconnect. Defaults: **115200 baud, slave 1, 8N1,
    no flow control**, 500 ms response timeout. Disconnect before changing settings.
+   The OBC flight software also uses `/dev/ttyS3` by default; stop its PDU
+   access before opening the same port in this GUI.
 4. Navigate with these keys:
 
 | Key | Action |
 |---|---|
-| Tab / Shift-Tab / Left / Right / 1–4 | Switch table |
+| Tab / Shift-Tab / Left / Right / 1–5 | Switch among four Modbus tables and the text console |
 | Up / Down / j / k | Select parameter |
 | PageUp / PageDown / Home / End | Scroll/select |
 | Enter / e | Edit selected writable value |
@@ -100,6 +119,16 @@ execution on physical hardware remains untested.
 | t | Prepare PC time in clock editor; still requires review/apply |
 | l | Recent activity and write results |
 | q / Ctrl-C | Quit (Ctrl-C also works inside a dialog) |
+
+The fifth tab is **Text console**. Press **F2** to set its port and baud
+(115200 for UART0 RS232, 9600 for the local PE3/PE4 software console), then
+**F3** to open it. Type a firmware command such as `help` and press **Enter**;
+**F4** clears the displayed output and **Ctrl-U** clears the input. On UART0,
+connect Modbus first and set the console port to the same device path. The
+application then sends text commands through the existing Modbus serial
+connection, one transaction at a time, and resumes polling afterward. If the
+console uses a separate physical port, it has its own serial connection and
+Modbus polling continues independently. Switching tabs does not stop polling.
 
 PDU RS232 is USART0 PE0 RX / PE1 TX, PC104 H1-19/20, fixed at 115200 baud.
 PDU RS485 is USART1 PD2 RX / PD3 TX, H1-37/38, with PD5 controlling the PDU's
@@ -147,6 +176,7 @@ application against a serial port at a time.
 - `src/map.rs`: complete firmware register catalog, scaling, limits and write encoding.
 - `src/rtu.rs`: serial RTU transport, deadline, CRC, exceptions and acknowledgment checks.
 - `src/worker.rs`: serialized background I/O and periodic reads; no writes during polling.
+- `src/console.rs`: independent serial session for firmware text commands and replies.
 - `src/main.rs`: terminal entry point, CLI settings and read-only probe.
 - `src/tui.rs`: Ratatui screens, keyboard controls and staged write dialogs.
 - `src/bin/desktop.rs`: optional egui/eframe desktop interface.
@@ -171,7 +201,7 @@ python3 tests/tui_smoke.py target/release/dal-pdu-gui
 cargo run --locked -- --probe /dev/ttyUSB0 115200 1
 ```
 
-Tests cover all four terminal views, dialogs and keyboard editing without a display, CRC/fragmented frames,
+Tests cover all four Modbus views, the text console tab, dialogs and keyboard editing without a display, CRC/fragmented frames,
 exceptions, invalid replies, register offsets, endian order, limits, signed and
 unavailable values, real serial reads/writes over a PTY, and worker polling.
 The real terminal application is also tested in a pseudo-terminal with display

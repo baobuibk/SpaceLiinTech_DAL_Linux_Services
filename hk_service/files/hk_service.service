@@ -1,0 +1,20 @@
+[Unit]
+Description=Housekeeping Telemetry Service (OBC/EXP)
+After=sysinit.target local-fs.target
+After=temp.service bme.service
+Wants=temp.service bme.service
+DefaultDependencies=no
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+RuntimeDirectory=dal/hk_service
+ExecStart=/home/root/tools/bin/hk_service
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -47,14 +47,56 @@ static int pause_ms(void *ctx, unsigned ms)
     }
     return stopped ? -1 : 0;
 }
+static int raw_image_valid(const uint8_t *data, size_t size)
+{
+    size_t sync = 0;
+    while (sync + 4 <= size && sync < 4096) {
+        if (!memcmp(data + sync, "\xaa\x99\x55\x66", 4)) return 1;
+        if (data[sync] != 0xff) break;
+        ++sync;
+    }
+    /* Xilinx bus-width detection sequence may precede the synchronization word. */
+    if (sync + 8 <= size &&
+        !memcmp(data + sync, "\x00\x00\x00\xbb\x11\x22\x00\x44", 8)) {
+        sync += 8;
+        while (sync < size && sync < 4096 && data[sync] == 0xff) ++sync;
+    }
+    return sync < 4096 && sync + 4 <= size &&
+           !memcmp(data + sync, "\xaa\x99\x55\x66", 4);
+}
+static size_t bit_payload_offset(const uint8_t *data, size_t size)
+{
+    static const uint8_t magic[] = {0x0f, 0xf0, 0x0f, 0xf0, 0x0f,
+                                    0xf0, 0x0f, 0xf0, 0x00};
+    size_t pos = 0;
+    if (size < 13 || data[0] != 0 || data[1] != sizeof(magic) ||
+        memcmp(data + 2, magic, sizeof(magic)) ||
+        data[11] != 0 || data[12] != 1) return 0;
+    pos = 13;
+    for (uint8_t key = 'a'; key <= 'd'; ++key) {
+        if (size - pos < 3 || data[pos++] != key) return 0;
+        size_t length = ((size_t)data[pos] << 8) | data[pos + 1];
+        pos += 2;
+        if (!length || length > size - pos || data[pos + length - 1] != 0) return 0;
+        if (key == 'b' &&
+            (length != sizeof("7a35tftg256") ||
+             memcmp(data + pos, "7a35tftg256", length))) return 0;
+        pos += length;
+    }
+    if (size - pos < 5 || data[pos++] != 'e') return 0;
+    size_t length = ((size_t)data[pos] << 24) | ((size_t)data[pos + 1] << 16) |
+                    ((size_t)data[pos + 2] << 8) | data[pos + 3];
+    pos += 4;
+    return length && length <= FLASH_SIZE && length == size - pos ? pos : 0;
+}
 static uint8_t *load_image(const char *path, size_t *size)
 {
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return NULL; }
     struct stat st;
     if (fstat(fileno(f), &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
-        st.st_size > FLASH_SIZE) {
-        fprintf(stderr, "Image must be a regular file of 1..16777216 bytes\n");
+        st.st_size > FLASH_SIZE + 65536u) {
+        fprintf(stderr, "Image must be a regular file of supported size\n");
         fclose(f); return NULL;
     }
     *size = (size_t)st.st_size;
@@ -63,28 +105,21 @@ static uint8_t *load_image(const char *path, size_t *size)
         free(data); fclose(f); return NULL;
     }
     fclose(f);
-    /* Expect a raw, uncompressed/unencrypted x1 boot binary; reject containers. */
-    size_t sync = 0;
-    while (sync + 4 <= *size && sync < 4096) {
-        if (data[sync] == 0xaa && data[sync+1] == 0x99 &&
-            data[sync+2] == 0x55 && data[sync+3] == 0x66) break;
-        if (data[sync] != 0xff) break;
-        ++sync;
+    /* A Vivado .bit wraps the same SPI x1 payload as the generated .bin. */
+    size_t offset = bit_payload_offset(data, *size);
+    if (offset) {
+        *size -= offset;
+        memmove(data, data + offset, *size);
     }
-    /* Xilinx bus-width detection sequence may precede the synchronization word. */
-    if (sync + 8 <= *size && !memcmp(data + sync, "\x00\x00\x00\xbb\x11\x22\x00\x44", 8)) {
-        sync += 8;
-        while (sync < *size && sync < 4096 && data[sync] == 0xff) ++sync;
-    }
-    if (sync >= 4096 || sync + 4 > *size || memcmp(data+sync, "\xaa\x99\x55\x66", 4)) {
-        fprintf(stderr, "Expected raw Xilinx .bin preamble; .bit/.mcs/FMOD containers are unsupported\n");
+    if (*size > FLASH_SIZE || !raw_image_valid(data, *size)) {
+        fprintf(stderr, "Expected raw Xilinx SPI x1 .bin or XC7A35T .bit image\n");
         free(data); return NULL;
     }
     return data;
 }
 static void usage(const char *name)
 {
-    printf("Usage: %s [--dry-run] [--device PATH] id|verify IMAGE.bin|program IMAGE.bin\n"
+    printf("Usage: %s [--dry-run] [--device PATH] id|reload|verify IMAGE.{bin,bit}|program IMAGE.{bin,bit}\n"
            "DAL OBC v1.1.0, S25FL128L. Operations interrupt FPGA execution.\n"
            "Programs address 0; erases through the final 4 KiB sector.\n", name);
 }
@@ -101,16 +136,18 @@ int main(int argc, char **argv)
     if (i >= argc) { usage(argv[0]); return 2; }
     enum operation op;
     if (!strcmp(argv[i], "id")) op = OP_ID;
+    else if (!strcmp(argv[i], "reload")) op = OP_RELOAD;
     else if (!strcmp(argv[i], "verify")) op = OP_VERIFY;
     else if (!strcmp(argv[i], "program")) op = OP_PROGRAM;
     else { usage(argv[0]); return 2; }
     ++i;
-    if (argc-i != (op == OP_ID ? 0 : 1)) { usage(argv[0]); return 2; }
+    if (argc-i != (op == OP_ID || op == OP_RELOAD ? 0 : 1)) { usage(argv[0]); return 2; }
     size_t size = 0;
-    uint8_t *image = op == OP_ID ? NULL : load_image(argv[i], &size);
-    if (op != OP_ID && !image) return 2;
-    printf("Device %s, SPI mode 0, 1 MHz; image %zu bytes, erase extent %zu bytes\n",
-           device, size, (size+4095)/4096*4096);
+    uint8_t *image = op == OP_ID || op == OP_RELOAD ? NULL : load_image(argv[i], &size);
+    if (op != OP_ID && op != OP_RELOAD && !image) return 2;
+    if (op == OP_RELOAD) puts("FPGA reload: assert reset, select FPGA Flash, wait 200 ms, release reset.");
+    else printf("Device %s, SPI mode 0, 1 MHz; image %zu bytes, erase extent %zu bytes\n",
+                device, size, (size+4095)/4096*4096);
     if (dry) { puts("Dry run: no hardware opened or changed."); free(image); return 0; }
     int result = 1;
     struct hardware hw = {.spi = -1, .gpio = {-1, -1}, .speed = 1000000};
@@ -128,12 +165,14 @@ int main(int argc, char **argv)
         hw.gpio[p] = open(paths[p], O_RDWR|O_CLOEXEC);
         if (hw.gpio[p] < 0) { perror(paths[p]); goto done; }
     }
-    hw.spi = open(device, O_RDWR|O_CLOEXEC);
-    if (hw.spi < 0) { perror(device); goto done; }
-    uint8_t mode = SPI_MODE_0, bits = 8;
-    if (ioctl(hw.spi, SPI_IOC_WR_MODE, &mode) ||
-        ioctl(hw.spi, SPI_IOC_WR_BITS_PER_WORD, &bits) ||
-        ioctl(hw.spi, SPI_IOC_WR_MAX_SPEED_HZ, &hw.speed)) { perror("SPI setup"); goto done; }
+    if (op != OP_RELOAD) {
+        hw.spi = open(device, O_RDWR|O_CLOEXEC);
+        if (hw.spi < 0) { perror(device); goto done; }
+        uint8_t mode = SPI_MODE_0, bits = 8;
+        if (ioctl(hw.spi, SPI_IOC_WR_MODE, &mode) ||
+            ioctl(hw.spi, SPI_IOC_WR_BITS_PER_WORD, &bits) ||
+            ioctl(hw.spi, SPI_IOC_WR_MAX_SPEED_HZ, &hw.speed)) { perror("SPI setup"); goto done; }
+    }
     struct sigaction action = {.sa_handler = stop};
     sigemptyset(&action.sa_mask);
     sigaction(SIGINT, &action, NULL); sigaction(SIGTERM, &action, NULL);

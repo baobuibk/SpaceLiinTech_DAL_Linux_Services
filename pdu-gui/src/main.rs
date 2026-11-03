@@ -15,6 +15,8 @@ fn run() -> Result<(), String> {
     let mut config = Config {
         port: if cfg!(windows) {
             "COM3"
+        } else if cfg!(all(target_os = "linux", target_arch = "arm")) {
+            "/dev/ttyS3"
         } else {
             "/dev/ttyUSB0"
         }
@@ -25,7 +27,7 @@ fn run() -> Result<(), String> {
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("DAL PDU terminal monitor (no desktop display required)\n\nUsage: dal-pdu-gui [--port PORT] [--baud BAUD] [--slave ID] [--timeout MS] [--connect]\n       dal-pdu-gui --probe PORT [BAUD] [SLAVE]\n\nKeys: c connect/disconnect; s settings; Tab/Left/Right tables; Up/Down select;\n      Enter/e edit; r refresh; t prepare PC clock; l activity; q/Ctrl-C quit.\nWrites require Enter to review and y to apply. --probe reads once without a TTY.");
+        println!("DAL PDU terminal monitor (no desktop display required)\n\nUsage: dal-pdu-gui [--port PORT] [--baud BAUD] [--slave ID] [--timeout MS] [--connect]\n       dal-pdu-gui --probe PORT [BAUD] [SLAVE]\n\nKeys: c connect/disconnect; s settings; Tab/Left/Right tabs; Up/Down select;\n      Enter/e edit; r refresh; t prepare PC clock; l activity; q quit on table tabs; Ctrl-C quit.\nText console tab: F2 port/baud; F3 open/close; F4 clear; Enter sends a command.\nWrites require Enter to review and y to apply. --probe reads once without a TTY.");
         return Ok(());
     }
     if args.first().map(String::as_str) == Some("--probe") {

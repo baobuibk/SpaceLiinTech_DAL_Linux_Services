@@ -1,0 +1,32 @@
+site_name: DAL OBC Flight Software Documentation
+site_description: Flight software architecture, operation, and BEE-DAL ICD
+docs_dir: docs
+site_dir: build-mkdocs
+
+theme:
+  name: readthedocs
+
+nav:
+  - Home: index.md
+  - Flight software:
+      - Architecture and ICD coverage: flight-software-architecture.md
+      - Commands and interfaces: flight-software.md
+      - Xem log flight software: flight-software-logs.md
+      - Flight command register: flight-command-register.md
+      - Test plan: flight_sw_test_plan.md
+      - OBC GUI command mapping: exp-gui-command-map.md
+      - DAL commands: dal-commands.md
+      - Deployment: deployment.md
+  - DALTUI:
+      - Run on host, OBC, and RS-422: daltui-running.md
+  - ICD and hardware:
+      - BEE-DAL ICD revision 1.0: icd.md
+      - ICD and console mapping: icd-console-mapping.md
+      - MPU and FPGA guide: DAL_OBC_V110_MPU_FPGA_Design_and_Programming.md
+      - RS-422 service review: RS422_Service_Review.md
+
+markdown_extensions:
+  - tables
+  - fenced_code
+  - toc:
+      permalink: true

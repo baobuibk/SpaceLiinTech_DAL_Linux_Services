@@ -148,6 +148,52 @@ impl Client {
         }
         Ok(())
     }
+    /// Send one firmware text CLI line between Modbus transactions on UART0.
+    pub fn text_command(&mut self, command: &str) -> Result<Vec<u8>, String> {
+        if command.len() > 63
+            || !command
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+        {
+            return Err("Use at most 63 printable ASCII characters".into());
+        }
+        std::thread::sleep(self.gap.saturating_sub(self.last_end.elapsed()));
+        let result = (|| {
+            self.port
+                .clear(serialport::ClearBuffer::Input)
+                .map_err(|e| e.to_string())?;
+            self.port
+                .write_all(command.as_bytes())
+                .and_then(|_| self.port.write_all(b"\r"))
+                .map_err(|e| e.to_string())?;
+            self.port.flush().map_err(|e| e.to_string())?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut response = Vec::new();
+            let mut buffer = [0; 512];
+            while Instant::now() < deadline && response.len() < 65536 {
+                match self.port.read(&mut buffer) {
+                    Ok(0) => return Err("Serial link closed".into()),
+                    Ok(size) => {
+                        response.extend_from_slice(&buffer[..size]);
+                        if response.ends_with(b"> ") {
+                            return Ok(response);
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::TimedOut
+                                | io::ErrorKind::WouldBlock
+                                | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Err("Text CLI response timeout or too long".into())
+        })();
+        self.last_end = Instant::now();
+        result
+    }
 }
 pub fn decode_read(function: u8, count: u16, response: &[u8]) -> Result<Vec<u16>, String> {
     let expected = if function <= 2 {

@@ -51,12 +51,15 @@ bring-up check; this tool uses the existing DAL device tree's CS0 assignment.
 
 ## Input and commands
 
-Use a raw, uncompressed/unencrypted Xilinx SPI x1 boot `.bin`, generated for
-XC7A35T and boot address zero. Supply a trusted image whose provenance and
-checksum you have checked. The tool checks length and the raw Xilinx preamble;
-it does **not** validate FPGA part identity, authenticate images, or prove the
-bitstream will boot. `.bit`, ASCII `.mcs`, and IFB FMOD-header containers are
-not accepted. The existing IFB `fmod_sign.py` format is not used here.
+Use a raw, uncompressed/unencrypted Xilinx SPI x1 boot `.bin` or a Vivado
+`.bit` for XC7A35T-FTG256, generated for boot address zero. For `.bit`, the
+tool checks the container header and part name, then writes and verifies only
+the embedded raw payload. The reference `blink.bit` payload matches
+`blink.bin` and `blink_flash.bin` byte for byte. Supply a trusted image whose
+provenance and checksum you have checked. The tool does **not** authenticate
+images or prove the bitstream will boot. ASCII `.mcs` and IFB FMOD-header
+containers are not accepted. The existing IFB `fmod_sign.py` format is not
+used here.
 
 ```sh
 # Host: validate input and print extent without opening hardware.
@@ -66,11 +69,16 @@ service/fpga_prog/build-host/fpga_prog --dry-run program boot.bin
 fpga_prog id
 fpga_prog program boot.bin
 fpga_prog verify boot.bin
+fpga_prog program blink.bit
+fpga_prog reload
 ```
 
 `id` and `verify` also interrupt the FPGA: reset is asserted before acquiring
 Flash. Successful `id` preserves an already-asserted reset; successful verify
-or program releases reset. Successful commands return Flash ownership to FPGA.
+or program releases reset. `reload` triggers a new configuration from the
+existing Flash contents without reading, erasing, or writing Flash. It asserts
+reset for 100 ms, selects the FPGA Flash path, waits 200 ms, then releases reset.
+It does not open the SPI device. Successful commands return Flash ownership to FPGA.
 The exit codes are 0 success, 1 hardware/operation failure, and 2 invalid input.
 
 ## Programming and failure behavior
@@ -86,6 +94,10 @@ later sectors remain untouched. Erased bytes are checked, data is programmed
 in at most 256-byte pages, and the complete payload is compared byte-for-byte
 with readback. Busy polling has bounded timeouts and transport errors propagate.
 Flash protection is not automatically disabled.
+
+After `id`, `verify`, or `program`, the tool waits 200 ms between returning
+Flash ownership to the FPGA and releasing reset. A previously asserted reset
+is preserved by `id`.
 
 Only success returns ownership and releases reset. Failure or handled
 SIGINT/SIGTERM leaves reset asserted after it has been acquired. Retry with a

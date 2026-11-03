@@ -1,0 +1,111 @@
+#!/usr/bin/env python
+# encoding: utf-8
+# Copyright (c) 2013-2017 GomSpace A/S. All rights reserved.
+
+import os
+import gs_gcc
+import gs_doc
+from waflib.Build import BuildContext
+
+APPNAME = 'gscsp'
+
+
+def libcsp_with_os(ctx):
+    if os.name == 'nt':
+        return 'windows'
+    if ctx.gs_is_linux():
+        return 'posix'
+    if ctx.gs_is_freertos():
+        return 'freertos'
+    return None
+
+
+def libcsp_with_driver_usart(ctx):
+    if os.name == 'nt':
+        return 'windows'
+    if ctx.gs_is_linux():
+        return 'linux'
+    return None
+
+
+def options(ctx):
+    ctx.load('gs_gcc gs_doc')
+    gs_gcc.gs_recurse(ctx)
+
+
+def configure(ctx):
+    ctx.load('gs_gcc gs_doc')
+
+    ctx.env.append_unique('FILES_GSCSP', 'src/*.c')
+    ctx.env.append_unique('USE_GSCSP', ['csp', 'csp_h', 'util'])
+
+    if ctx.options.enable_if_i2c:
+        ctx.env.append_unique('FILES_GSCSP', 'src/drivers/i2c/*.c')
+
+    if ctx.gs_is_freertos():
+        ctx.env.append_unique('FILES_GSCSP', 'src/drivers/can/*.c')
+        ctx.env.append_unique('FILES_GSCSP', 'src/drivers/kiss/*.c')
+        ctx.env.append_unique('FILES_GSCSP', 'src/freertos/*.c')
+        ctx.env.append_unique('USE_GSCSP', ['embed'])
+
+    if ctx.gs_is_linux():
+        ctx.env.append_unique('FILES_GSCSP', 'src/linux/*.c')
+
+    # libcsp options
+    ctx.options.with_os = libcsp_with_os(ctx)
+    ctx.options.with_driver_usart = libcsp_with_driver_usart(ctx)
+    bindings = True if (ctx.gs_is_linux() and not ctx.gs_is_build_disabled(['shlib', 'csp_shlib'])) else False
+    ctx.options.enable_bindings = bindings
+    ctx.options.enable_python3_bindings = bindings
+    ctx.options.disable_stlib = True
+    ctx.options.enable_crc32 = True
+    ctx.options.with_connection_so = ctx.options.with_connection_so | 0x0040  # always CRC32, disable CSP_O_NOCRC32
+
+    if ctx.options.enable_if_can and ctx.options.enable_can_socketcan:
+        #ctx.check_cc(lib='socketcan', mandatory=True)
+        print("INFO: Skipping socketcan check - forcing include")
+        ctx.env.LIB_SOCKETCAN = ['socketcan']
+
+    ctx.gs_add_doxygen(input=['include', 'lib/libcsp/include'])
+
+    gs_gcc.gs_recurse(ctx)
+
+
+def build(ctx):
+    gs_gcc.gs_recurse(ctx)
+
+    public_include = ctx.gs_include(name=APPNAME,
+                                    includes=['include'])
+
+    ctx.gs_objects(source=ctx.path.ant_glob(ctx.env.FILES_GSCSP),
+                   target=APPNAME,
+                   use=ctx.env.USE_GSCSP + [public_include])
+
+    ctx.gs_shlib(source=ctx.path.ant_glob(ctx.env.FILES_GSCSP),
+                 target=APPNAME,
+                 gs_prefix='',  # make library libgscsp
+                 gs_use_shlib=ctx.env.USE_GSCSP + [public_include])
+
+    ctx.gs_python_bindings(source=ctx.path.ant_glob('src/bindings/python/pygscsp.c'),
+                           target=APPNAME,
+                           gs_prefix='',  # make library libgscsp
+                           gs_use_shlib=ctx.env.USE_GSCSP + [APPNAME, public_include],
+                           package='libgscsp')
+
+
+def doc(ctx):
+    gs_doc.add_task_library_doc(ctx, keyvalues={
+        'gs_prod_name': 'lib'+APPNAME,
+        'gs_prod_desc': 'GomSpace CSP extension',
+    })
+
+
+class Doc(BuildContext):
+    cmd = fun = 'doc'
+
+
+def gs_dist(ctx):
+    gs_gcc.gs_recurse(ctx)
+    ctx.add_default_files(source_module=True)
+    ctx.add_files(ctx.path.ant_glob(['lib/libcsp/**/*']))
+    ctx.add_license_file("CSP", "lib/libcsp/COPYING")

@@ -1,0 +1,34 @@
+#!/usr/bin/env python
+# encoding: utf-8
+# Copyright (c) 2013-2018 GomSpace A/S. All rights reserved.
+
+import gs_gcc
+
+APPNAME = 'nanocam2-client'
+
+
+def options(ctx):
+    gr = ctx.add_option_group('NanoCam client options')
+    gr.add_option('--disable-nanocam-cmd', action='store_true', help='Disable client cmd code for NanoCam')
+
+
+def configure(ctx):
+    ctx.env.append_unique('FILES_NANOCAM2_CLIENT', ['src/nanocam.c'])
+    if not ctx.options.disable_nanocam_cmd:
+        ctx.env.append_unique('FILES_NANOCAM2_CLIENT', ['src/cmd_nanocam.c'])
+
+    ctx.gs_add_doxygen(exclude=['*/include/deprecated/*',
+                                '*/include/gs/cam/nanocam_types.h'])
+
+
+def build(ctx):
+    public_include = APPNAME + '_h'
+    ctx(export_includes=['include', 'include/deprecated/cam/param'], name=public_include)
+
+    ctx.objects(source=ctx.path.ant_glob(ctx.env.FILES_NANOCAM2_CLIENT),
+                target=APPNAME,
+                use=['csp', 'gosh', 'util', 'param', public_include])
+
+
+def gs_dist(ctx):
+    ctx.add_default_files(source_module=True)

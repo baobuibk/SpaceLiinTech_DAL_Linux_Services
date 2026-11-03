@@ -13,7 +13,7 @@ struct backend {
     int (*gpio)(void *, unsigned, int);
     int (*pause_ms)(void *, unsigned);
 };
-enum operation { OP_ID, OP_VERIFY, OP_PROGRAM };
+enum operation { OP_ID, OP_VERIFY, OP_PROGRAM, OP_RELOAD };
 /* On any failure after reset is asserted, do not release it or hand back SPI. */
 int program_run(struct backend *, enum operation, const uint8_t *, size_t);
 #endif

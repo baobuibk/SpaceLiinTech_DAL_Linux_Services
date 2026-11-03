@@ -7,7 +7,7 @@
 struct mock {
     uint8_t memory[8192];
     int reset, owner, wel, released, writes, erases, calls, fail_at;
-    int bad_id, no_wel, busy, corrupt, transfers;
+    int bad_id, no_wel, busy, corrupt, transfers, selected_fpga, handoff_wait_ms;
 };
 static int fault(struct mock *m) { return ++m->calls == m->fail_at; }
 static int gpio(void *ctx, unsigned pin, int value)
@@ -15,18 +15,24 @@ static int gpio(void *ctx, unsigned pin, int value)
     struct mock *m = ctx;
     if (fault(m)) return -1;
     if (pin == 0) {
-        if (!value) { assert(m->owner == 1); m->released++; }
+        if (!value) {
+            assert(m->owner == 1 && m->selected_fpga && m->handoff_wait_ms == 200);
+            m->released++;
+        }
         m->reset = value;
     } else {
         assert(m->reset == 1);
         m->owner = value;
+        if (value) m->selected_fpga = 1;
     }
     return 0;
 }
 static int pause_ms(void *ctx, unsigned ms)
 {
-    (void)ms;
-    return fault(ctx) ? -1 : 0;
+    struct mock *m = ctx;
+    if (fault(m)) return -1;
+    if (m->selected_fpga) m->handoff_wait_ms = (int)ms;
+    return 0;
 }
 static int xfer(void *ctx, const uint8_t *tx, uint8_t *rx, size_t n)
 {
@@ -92,6 +98,15 @@ int main(void)
     assert(run(&m,OP_VERIFY,image,sizeof(image),0)==0 && !m.writes && !m.reset);
     m=(struct mock){.owner=1,.reset=1};
     assert(run(&m,OP_ID,NULL,0,1)==0 && m.reset && !m.released);
+    m=(struct mock){.owner=0};
+    assert(run(&m,OP_RELOAD,NULL,0,0)==0 && !m.reset && m.owner &&
+           m.released==1 && !m.transfers && m.handoff_wait_ms==200);
+    int reload_calls=m.calls;
+    for (int i=1; i<=reload_calls; ++i) {
+        m=(struct mock){.owner=0,.fail_at=i};
+        assert(run(&m,OP_RELOAD,NULL,0,0)!=0 && !m.released && !m.transfers);
+        if (i>1) assert(m.reset);
+    }
     m=(struct mock){.owner=1};
     assert(run(&m,OP_PROGRAM,image,FLASH_SIZE+1u,0)!=0 && !m.calls);
     assert(run(&m,OP_PROGRAM,image,0,0)!=0 && !m.calls);

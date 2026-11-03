@@ -70,10 +70,16 @@ static int verify(struct backend *b, const uint8_t *image, size_t size)
 
 int program_run(struct backend *b, enum operation op, const uint8_t *image, size_t size)
 {
-    if (op < OP_ID || op > OP_PROGRAM ||
-        (op != OP_ID && (!image || !size || size > FLASH_SIZE))) return -1;
+    if (op < OP_ID || op > OP_RELOAD ||
+        (op != OP_ID && op != OP_RELOAD && (!image || !size || size > FLASH_SIZE))) return -1;
     /* Do not power-cycle: Flash and FPGA rail relationships need board validation. */
     if (b->gpio(b->ctx, 0, 1)) return -1;
+    if (op == OP_RELOAD) {
+        if (b->pause_ms(b->ctx, 100) || b->gpio(b->ctx, 1, 1) ||
+            b->pause_ms(b->ctx, 200) || b->gpio(b->ctx, 0, 0)) goto fail;
+        puts("FPGA configuration reset released; readiness is not monitored.");
+        return 0;
+    }
     if (b->pause_ms(b->ctx, 100) || b->gpio(b->ctx, 1, 0) ||
         b->pause_ms(b->ctx, 10)) goto fail;
     if (ready(b, 30000)) goto fail;
@@ -113,7 +119,7 @@ int program_run(struct backend *b, enum operation op, const uint8_t *image, size
         }
     }
     if (op != OP_ID && verify(b, image, size)) goto fail;
-    if (b->gpio(b->ctx, 1, 1) || b->pause_ms(b->ctx, 10) ||
+    if (b->gpio(b->ctx, 1, 1) || b->pause_ms(b->ctx, 200) ||
         b->gpio(b->ctx, 0, op == OP_ID ? b->initial_reset : 0)) goto fail;
     puts(op == OP_ID && b->initial_reset ? "Flash returned to FPGA; reset remains held." :
          "Flash returned to FPGA; configuration reset released. FPGA readiness is not monitored.");

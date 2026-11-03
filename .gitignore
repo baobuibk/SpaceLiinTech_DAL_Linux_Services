@@ -63,3 +63,5 @@ CTestTestfile.cmake
 # Executables and packages staged by make deploy.
 /deploy/*
 !/deploy/.gitignore
+!/deploy/Makefile
+!/deploy/README.md

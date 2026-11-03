@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Thin single-shot wrapper around csp-client-lite.
+#
+# Routes a bare verb to the right command group so you don't have to type
+# 'rparam'/'rgosh' every time, then runs the binary once and exits - e.g.:
+#
+#   lite-client -c=can0 ping 11
+#   lite-client -c=can0 getall 11 2
+#   lite-client -c=can0 getval 11 2 bme_mC
+#
+# Expects csp-client-lite to sit next to this script (as it does in build/
+# after './waf build'), or on PATH.
+set -eu
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -x "$script_dir/csp-client-lite" ]; then
+    bin="$script_dir/csp-client-lite"
+else
+    bin="csp-client-lite"
+fi
+
+print_help() {
+    cat <<'EOF'
+usage: lite-client [csp-client-lite options] <verb> [args...]
+
+Runs one command against csp-client-lite and exits (one-shot mode) - no need
+to enter the interactive console. Options (e.g. -c=can1) must come first.
+
+Verbs are routed automatically, so you don't have to type 'rparam'/'rgosh':
+  ping|rps|memfree|buffree|reboot|shutdown|uptime|cmp|route|ifc|conn|rdpopt
+        -> passed straight through (default CSP commands)
+  init|download|getall|getval|setval|list|get|set|copy|load|save|reset|send|wd|timeout|
+  checksum|autosend
+        -> routed to 'rparam <verb> ...'
+  run|server
+        -> routed to 'rgosh <verb> ...'
+  anything else (e.g. 'rparam get ...', 'help', 'help rparam getall')
+        -> passed through as-is
+
+Shortcuts:
+  getall [node] [table-id]   rparam: download the table spec (if given) then read it
+  getval <node> <table-id> <parameter>  rparam: read one value in one invocation
+  setval <node> <table-id> <parameter> <value>  rparam: write one value in one invocation
+  run [node] <command>       rgosh: set the server (if given) then run the command
+
+Examples:
+  lite-client -c=can0 ping 11
+  lite-client -c=can0 getall 11 2
+  lite-client -c=can0 getval 11 2 bme_mC
+  lite-client -c=can0 run 11 "ntc_read_all"
+  lite-client -c=can1 help                 # full command list from csp-client-lite
+  lite-client -c=can1 help rparam getall   # usage for a specific (sub)command
+EOF
+}
+
+case "${1:-}" in
+    -h|--help)
+        print_help
+        exit 0
+        ;;
+esac
+
+opts=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -*) opts+=("$1"); shift ;;
+        *) break ;;
+    esac
+done
+
+if [ $# -eq 0 ]; then
+    print_help >&2
+    exit 1
+fi
+
+verb="$1"
+shift
+
+case "$verb" in
+    # default CSP commands - already top-level, pass through unchanged
+    ping|rps|memfree|buffree|reboot|shutdown|uptime|cmp|route|ifc|conn|rdpopt)
+        exec "$bin" "${opts[@]}" "$verb" "$@"
+        ;;
+    # rparam sub-commands
+    init|download|getall|getval|setval|list|get|set|copy|load|save|reset|send|wd|timeout|checksum|autosend)
+        exec "$bin" "${opts[@]}" rparam "$verb" "$@"
+        ;;
+    # rgosh sub-commands
+    run|server)
+        exec "$bin" "${opts[@]}" rgosh "$verb" "$@"
+        ;;
+    # already fully qualified, or anything else - pass through as-is
+    *)
+        exec "$bin" "${opts[@]}" "$verb" "$@"
+        ;;
+esac

@@ -49,6 +49,8 @@ try:
     time.sleep(0.2)
     os.write(master, b"\t")
     collect_until(b"RS485 baud configuration")
+    os.write(master, b"\t\t\t\t")
+    collect_until(b"Console controls")
     os.write(master, b"q")
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -62,7 +64,7 @@ try:
     flags = termios.tcgetattr(master)[3]
     assert flags & termios.ICANON and flags & termios.ECHO, "Terminal was not restored"
     assert b"WinitEventLoop" not in output
-    print("PASS: no-display terminal startup, settings, table navigation, exit and terminal restoration")
+    print("PASS: no-display terminal startup, settings, console tab, exit and terminal restoration")
 finally:
     if not reaped:
         os.kill(pid, signal.SIGKILL)
