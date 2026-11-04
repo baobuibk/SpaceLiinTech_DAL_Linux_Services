@@ -35,6 +35,7 @@ pub fn draw(f: &mut Frame, st: &State, area: Rect) {
         let control = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(cols[2])[i];
         let mut lines = vec![
+            kv("12V_EXP", 11, vec![onoff(e.exp12v)]),
             kv(
                 "Output",
                 11,
