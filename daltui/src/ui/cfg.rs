@@ -81,17 +81,17 @@ fn draw_ports(f: &mut Frame, st: &State, area: Rect) {
             _ => ("Restart FSW", "press Enter to apply saved settings"),
         };
         lines.push(Line::from(vec![
-            txt(if selected { "▶ " } else { "  " }, Color::Yellow),
+            txt(if selected { "▶ " } else { "  " }, Color::Green),
             txt(
                 format!("{label:<20}"),
-                if selected { Color::Yellow } else { Color::Gray },
+                if selected { Color::Green } else { Color::Gray },
             ),
             txt(
                 value.to_string(),
                 if selected && st.cfg_edit.is_some() {
-                    Color::Yellow
+                    Color::Green
                 } else {
-                    Color::White
+                    Color::Green
                 },
             ),
         ]));
@@ -101,13 +101,7 @@ fn draw_ports(f: &mut Frame, st: &State, area: Rect) {
         " Enter: edit/save  Ctrl-U: clear  </>/p/Esc: link settings",
         Color::DarkGray,
     )));
-    panel(
-        f,
-        left[0],
-        "Flight software serial ports",
-        Color::Magenta,
-        lines,
-    );
+    control_panel(f, left[0], "Flight software serial ports", lines);
     let live = &st.sim.live;
     let state = if live.mode != Mode::Console {
         "Select CONSOLE on link settings"
@@ -124,7 +118,7 @@ fn draw_ports(f: &mut Frame, st: &State, area: Rect) {
             9,
             state,
             if live.mode == Mode::Console {
-                Color::Yellow
+                Color::Green
             } else {
                 Color::Red
             },
@@ -179,7 +173,7 @@ fn draw_config(f: &mut Frame, st: &State, area: Rect) {
                 } else {
                     l.rs422_path.clone()
                 };
-                let c = if editing { Color::Yellow } else { Color::White };
+                let c = if editing { Color::Green } else { Color::Green };
                 vec![txt(v, c)]
             }
             3 => vec![txt(
@@ -188,12 +182,12 @@ fn draw_config(f: &mut Frame, st: &State, area: Rect) {
                 } else {
                     format!("{:.1} s [ EDIT ]", l.poll_every)
                 },
-                Color::White,
+                Color::Green,
             )],
             _ => vec![txt("press Enter", Color::DarkGray)],
         };
         let mark = if sel {
-            Span::styled("▶", Style::default().fg(Color::Yellow))
+            Span::styled("▶", Style::default().fg(Color::Green))
         } else {
             Span::raw(" ")
         };
@@ -203,7 +197,7 @@ fn draw_config(f: &mut Frame, st: &State, area: Rect) {
                 format!(" {name:<14} "),
                 if sel {
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(Color::Green)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     lbl()
@@ -227,7 +221,7 @@ fn draw_config(f: &mut Frame, st: &State, area: Rect) {
         " < > or p: flight software port settings",
         Color::Cyan,
     )));
-    panel(f, area, "Configuration", Color::Magenta, lines);
+    control_panel(f, area, "Configuration", lines);
 }
 
 fn draw_status(f: &mut Frame, st: &State, area: Rect) {

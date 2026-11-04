@@ -122,17 +122,16 @@ fn update_strip(f: &mut Frame, st: &State, area: Rect) {
         txt("   ".to_string(), Color::Gray),
         status,
     ];
-    panel(
+    control_panel(
         f,
         area,
         "Housekeeping",
-        Color::Green,
         vec![Line::from(row0), Line::from(row1)],
     );
 }
 
 fn card(f: &mut Frame, st: &State, sub: Sub, area: Rect) {
-    let color = sub_color(sub);
+    let color = STATUS_COLOR;
     let s = &st.sim;
     let block = Block::bordered()
         .border_style(Style::default().fg(color))
@@ -146,7 +145,7 @@ fn card(f: &mut Frame, st: &State, sub: Sub, area: Rect) {
         Sub::Exp => exp(s),
         Sub::Pdu => pdu(s),
     };
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    f.render_widget(Paragraph::new(status_lines(lines)).block(block), area);
 }
 
 fn sw(label: &str, on: bool) -> Vec<Span<'static>> {

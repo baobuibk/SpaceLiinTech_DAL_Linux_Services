@@ -290,6 +290,8 @@ impl Sim {
             c.saved_file = None;
             c.result = "not read".into();
             c.temp_centi = None;
+            c.mean_centi = None;
+            c.peak = None;
         }
         e.ht_status_seen = [false; 4];
         e.ht_status_at = None;
@@ -367,6 +369,39 @@ impl Sim {
             );
             self.live.ir_verify_at = self.t + 1.0;
         }
+        // Complete an explicitly requested camera capture even with background polling off.
+        if self.live.cam_clock >= 1.0 && self.live.pending == 0 {
+            self.live.cam_clock = 0.0;
+            for camera in 0..2 {
+                if let Some(since) = self.live.cam_wait[camera] {
+                    if self.t - since > 30.0 {
+                        self.live.cam_wait[camera] = None;
+                        self.exp.camera[camera].result = "timeout waiting for capture".into();
+                    } else {
+                        self.live.send(
+                            proto::exp_run(&format!("camera_status {camera}")),
+                            Why::Action("exp.cam_status".into()),
+                        );
+                    }
+                }
+            }
+            let mut check_download = false;
+            for camera in 0..2 {
+                if let Some(since) = self.live.cam_download_wait[camera] {
+                    if self.t - since > 120.0 {
+                        self.live.cam_download_wait[camera] = None;
+                    } else {
+                        check_download = true;
+                    }
+                }
+            }
+            if check_download {
+                self.live.send(
+                    proto::exp_csp_snapshot(6),
+                    Why::Action("exp.cam_status".into()),
+                );
+            }
+        }
         if self.live.control_only {
             return;
         }
@@ -425,35 +460,6 @@ impl Sim {
             self.live.valve_verify_at = None;
             self.live.send(proto::fld_stat(), Why::Refresh);
             self.live.send(proto::pc_stat(), Why::Refresh);
-        }
-        if self.live.cam_clock >= 1.0 && self.live.pending == 0 {
-            self.live.cam_clock = 0.0;
-            for camera in 0..2 {
-                if let Some(since) = self.live.cam_wait[camera] {
-                    if self.t - since > 30.0 {
-                        self.live.cam_wait[camera] = None;
-                        self.exp.camera[camera].result = "timeout waiting for capture".into();
-                    } else {
-                        self.live.send(
-                            proto::exp_run(&format!("camera_status {camera}")),
-                            Why::Refresh,
-                        );
-                    }
-                }
-            }
-            let mut check_download = false;
-            for camera in 0..2 {
-                if let Some(since) = self.live.cam_download_wait[camera] {
-                    if self.t - since > 120.0 {
-                        self.live.cam_download_wait[camera] = None;
-                    } else {
-                        check_download = true;
-                    }
-                }
-            }
-            if check_download {
-                self.live.send(proto::exp_csp_snapshot(6), Why::Refresh);
-            }
         }
         if let Some(until) = self.live.burn_verify_until {
             if self.t >= until {
@@ -575,6 +581,8 @@ impl Sim {
                     self.exp.camera[camera].result = "request queued".into();
                     if id == "exp.cam_capture" {
                         self.exp.camera[camera].temp_centi = None;
+                        self.exp.camera[camera].mean_centi = None;
+                        self.exp.camera[camera].peak = None;
                         self.exp.camera[camera].object_id = 0;
                         self.exp.camera[camera].saved_file = None;
                         self.live.cam_download_wait[camera] = Some(self.t);
@@ -650,7 +658,8 @@ impl Sim {
                     );
                 }
                 if id == "exp.cam_status" {
-                    self.live.send(proto::exp_csp_snapshot(6), Why::Refresh);
+                    self.live
+                        .send(proto::exp_csp_snapshot(6), Why::Action(id.to_string()));
                 }
                 if matches!(
                     id,
@@ -783,8 +792,7 @@ fn is_local(id: &str) -> bool {
             | "exp.cam_emiss"
             | "exp.cam_x"
             | "exp.cam_y"
-            | "exp.cam_w"
-            | "exp.cam_h"
+            | "exp.cam_delta"
             | "exp.burn_sel"
             | "exp.burn_duty"
             | "exp.burn_time"
@@ -973,14 +981,17 @@ pub fn plan(s: &mut Sim, id: &str, act: &Act) -> Result<Vec<Cmd>, String> {
         "exp.cam_init" => exp(format!("camera_init {}", e.cam_sel)),
         "exp.cam_capture" => exp(format!("camera_capture {}", e.cam_sel)),
         "exp.cam_status" => exp(format!("camera_status {}", e.cam_sel)),
-        "exp.cam_temp" => {
+        "exp.cam_temp" | "exp.cam_mean" => {
             let c = &e.camera[e.cam_sel];
-            if c.x + c.width > 32 || c.y + c.height > 24 {
-                return Err("temperature ROI exceeds 32x24 image".into());
-            }
+            let (x, y, w, h) = c.point_region().ok_or("invalid point measurement region")?;
             exp(format!(
-                "camera_temp {} {} {} {} {}",
-                e.cam_sel, c.x, c.y, c.width, c.height
+                "camera_temp {} {} {} {} {}{}",
+                e.cam_sel,
+                x,
+                y,
+                w,
+                h,
+                if id == "exp.cam_mean" { " mean" } else { "" }
             ))
         }
         // OBC power switches: pwr_en OBC <output> on|off (TYPE 01 / ADDR 03)
@@ -1922,6 +1933,10 @@ fn apply_camera_reply(s: &mut Sim, command: &str, text: &str) {
             c.data_exist = v != 0;
         }
         if let Some(v) = status_u32(line, "request") {
+            if c.request_id != v {
+                c.temp_centi = None;
+                c.mean_centi = None;
+            }
             c.request_id = v;
         }
         if let Some(v) = status_u32(line, "object") {
@@ -1930,6 +1945,22 @@ fn apply_camera_reply(s: &mut Sim, command: &str, text: &str) {
             }
             c.object_id = v;
         }
+        c.peak = text
+            .lines()
+            .find(|l| l.starts_with("CAMERA_PEAK "))
+            .and_then(|l| {
+                if status_value(l, "valid") != Some(1)
+                    || status_u32(l, "request") != Some(c.request_id)
+                {
+                    return None;
+                }
+                let x = status_value(l, "x")?;
+                let y = status_value(l, "y")?;
+                if !(0..32).contains(&x) || !(0..24).contains(&y) {
+                    return None;
+                }
+                Some((status_value(l, "max_cC")?, x as u8, y as u8))
+            });
         if let Some(v) = status_word(line, "result") {
             c.result = v.into();
             if !matches!(v, "QUEUED" | "RUNNING") {
@@ -1942,7 +1973,26 @@ fn apply_camera_reply(s: &mut Sim, command: &str, text: &str) {
     } else if op == "camera_temp" {
         if let Some(line) = text.lines().find(|line| line.starts_with("CAMERA_TEMP ")) {
             let c = &mut s.exp.camera[camera];
-            c.temp_centi = status_value(line, "max_cC");
+            if status_u32(line, "request") != Some(c.request_id) {
+                return;
+            }
+            let region: Vec<i32> = command
+                .split_whitespace()
+                .skip(3)
+                .take(4)
+                .filter_map(|v| v.parse().ok())
+                .collect();
+            let Some((x, y, w, h)) = c.point_region() else {
+                return;
+            };
+            if region != [x, y, w, h] {
+                return;
+            }
+            if command.ends_with(" mean") {
+                c.mean_centi = status_value(line, "mean_cC");
+            } else {
+                c.temp_centi = status_value(line, "max_cC");
+            }
             c.sample_ms = status_u32(line, "sample_ms").unwrap_or(0);
         }
     }
@@ -1951,6 +2001,40 @@ fn apply_camera_reply(s: &mut Sim, command: &str, text: &str) {
 #[cfg(test)]
 mod ir_camera_tests {
     use super::*;
+
+    #[test]
+    fn capture_peak_and_point_average_remain_separate() {
+        let mut s = Sim::new();
+        apply_camera_reply(&mut s, "exp_run camera_status 0",
+            "CAMERA camera=0 initialized=1 request=9 op=2 result=OK object=7\nCAMERA_PEAK camera=0 request=9 valid=1 max_cC=3000 x=31 y=23 sample_ms=100");
+        assert_eq!(s.exp.camera[0].peak, Some((3000, 31, 23)));
+        s.exp.camera[0].x = 10;
+        s.exp.camera[0].y = 10;
+        s.exp.camera[0].delta = 2;
+        let command = plan(&mut s, "exp.cam_mean", &Act::Run).unwrap()[0]
+            .text
+            .clone();
+        assert_eq!(command, "exp_run camera_temp 0 8 8 5 5 mean");
+        apply_camera_reply(
+            &mut s,
+            &command,
+            "CAMERA_TEMP camera=0 request=9 roi=8,8,5,5 max_cC=2800 mean_cC=2500 sample_ms=100",
+        );
+        assert_eq!(s.exp.camera[0].mean_centi, Some(2500));
+        assert_eq!(s.exp.camera[0].temp_centi, None);
+        assert_eq!(s.exp.camera[0].peak, Some((3000, 31, 23)));
+        s.exp.camera[0].mean_centi = None;
+        s.exp.camera[0].delta = 0;
+        apply_camera_reply(
+            &mut s,
+            &command,
+            "CAMERA_TEMP camera=0 request=9 mean_cC=2500 sample_ms=100",
+        );
+        assert_eq!(s.exp.camera[0].mean_centi, None);
+        apply_camera_reply(&mut s, "exp_run camera_status 0",
+            "CAMERA camera=0 initialized=1 request=10 op=2 result=RUNNING object=7\nCAMERA_PEAK camera=0 request=10 valid=0");
+        assert_eq!(s.exp.camera[0].peak, None);
+    }
 
     #[test]
     fn saved_camera_name_requires_matching_boot_object_and_source() {
@@ -1976,7 +2060,7 @@ mod ir_camera_tests {
         let cfg = plan(&mut s, "exp.cam_apply", &Act::Run).unwrap();
         assert_eq!(
             cfg[0].text,
-            "exp_run camera_config 1 mlx90642 102 float32 8 1000"
+            "exp_run camera_config 1 mlx90640 51 float32 8 1000"
         );
         assert_eq!(
             plan(&mut s, "exp.cam_capture", &Act::Run).unwrap()[0].text,
@@ -1984,13 +2068,13 @@ mod ir_camera_tests {
         );
         assert_eq!(
             plan(&mut s, "exp.cam_address_set", &Act::Run).unwrap()[0].text,
-            "exp_run camera_address_set 1 102"
+            "exp_run camera_address_set 1 51"
         );
         assert_eq!(
             plan(&mut s, "exp.cam_temp", &Act::Run).unwrap()[0].text,
-            "exp_run camera_temp 1 0 0 32 24"
+            "exp_run camera_temp 1 0 0 1 1"
         );
-        s.exp.camera[1].x = 1;
+        s.exp.camera[1].x = 32;
         assert!(plan(&mut s, "exp.cam_temp", &Act::Run).is_err());
     }
 
@@ -2008,7 +2092,7 @@ mod ir_camera_tests {
         assert!(s.live.cam_wait[0].is_none());
         apply_camera_reply(
             &mut s,
-            "exp_run camera_temp 0 0 0 32 24",
+            "exp_run camera_temp 0 0 0 1 1",
             "CAMERA_TEMP camera=0 request=41 roi=0,0,32,24 max_cC=2534 sample_ms=4294967294",
         );
         assert_eq!(s.exp.camera[0].temp_centi, Some(2534));

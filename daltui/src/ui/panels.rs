@@ -181,7 +181,7 @@ fn exp(s: &Sim, rail_line: RailFn, page: usize) -> (Vec<Panel>, Vec<Panel>) {
         3 => return exp_motors(s),
         4 => return exp_ir(s),
         5 => return exp_burn(s),
-        8 => return exp_camera(s),
+        8 => return exp_camera(s, 36),
         _ => {}
     }
     let link = if e.link {
@@ -368,64 +368,37 @@ fn exp(s: &Sim, rail_line: RailFn, page: usize) -> (Vec<Panel>, Vec<Panel>) {
     )
 }
 
-fn exp_camera(s: &Sim) -> (Vec<Panel>, Vec<Panel>) {
+pub fn draw_exp_camera(f: &mut Frame, st: &State, area: Rect) {
+    let (mut cards, transfer) = exp_camera(&st.sim, area.width.saturating_sub(2) as usize);
+    cards.extend(transfer);
+    column(f, area, cards, STATUS_COLOR);
+}
+
+fn exp_camera(s: &Sim, content_width: usize) -> (Vec<Panel>, Vec<Panel>) {
     let e = &s.exp;
     let mut cards = Vec::new();
     for i in 0..2 {
         let c = &e.camera[i];
-        let mut lines = vec![
+        let temperature =
+            |v: Option<i32>| v.map_or("n/a".into(), |v| format!("{:.2} °C", v as f32 / 100.0));
+        let saved = if c.saved_file.is_some() {
+            "saved"
+        } else if c.object_id > 0 && s.live.cam_download_wait[i].is_some() {
+            "waiting for FSW"
+        } else if c.object_id > 0 {
+            "not confirmed"
+        } else {
+            "n/a"
+        };
+        let lines = vec![
             kv1(
-                "Selected",
-                11,
-                if i == e.cam_sel { "YES" } else { "no" },
-                if i == e.cam_sel {
-                    Color::Green
-                } else {
-                    Color::DarkGray
-                },
-            ),
-            kv1(
-                "Sensor",
-                11,
-                if c.confirmed {
-                    ["MLX90640", "MLX90642"][c.actual_model]
-                } else {
-                    "n/a"
-                },
-                Color::White,
-            ),
-            kv1(
-                "Address",
-                11,
-                if c.confirmed {
-                    format!("0x{:02X}", c.actual_address)
-                } else {
-                    "n/a".into()
-                },
-                Color::White,
-            ),
-            kv1(
-                "Restart",
-                11,
-                if c.address_restart_required {
-                    "required"
-                } else {
-                    "no"
-                },
-                if c.address_restart_required {
-                    Color::Yellow
-                } else {
-                    Color::DarkGray
-                },
-            ),
-            kv1(
-                "Format / Hz",
-                11,
+                "Sensor / address",
+                16,
                 if c.confirmed {
                     format!(
-                        "{} / {}",
-                        ["int16", "float32"][c.actual_format],
-                        c.actual_hz
+                        "{} / 0x{:02X}",
+                        ["MLX90640", "MLX90642"][c.actual_model],
+                        c.actual_address
                     )
                 } else {
                     "n/a".into()
@@ -433,28 +406,38 @@ fn exp_camera(s: &Sim) -> (Vec<Panel>, Vec<Panel>) {
                 Color::White,
             ),
             kv1(
-                "Ready",
-                11,
-                if c.initialized {
-                    "initialized"
+                "Format",
+                16,
+                if c.confirmed {
+                    ["int16", "float32"][c.actual_format]
                 } else {
-                    "not initialized"
+                    "n/a"
                 },
-                if c.initialized {
-                    Color::Green
-                } else {
-                    Color::Yellow
-                },
+                Color::White,
             ),
             kv1(
-                "I2C buffer",
-                11,
-                match c.buffer_enabled {
-                    Some(true) => "enabled",
-                    Some(false) => "disabled",
-                    None => "n/a",
+                "Refresh rate",
+                16,
+                if c.confirmed {
+                    format!("{} Hz", c.actual_hz)
+                } else {
+                    "n/a".into()
                 },
-                if c.buffer_enabled == Some(true) {
+                Color::White,
+            ),
+            kv1(
+                "Ready / I2C",
+                16,
+                format!(
+                    "{} / {}",
+                    if c.initialized { "ready" } else { "not ready" },
+                    match c.buffer_enabled {
+                        Some(true) => "enabled",
+                        Some(false) => "disabled",
+                        None => "n/a",
+                    }
+                ),
+                if c.initialized && c.buffer_enabled == Some(true) {
                     Color::Green
                 } else {
                     Color::Yellow
@@ -462,7 +445,7 @@ fn exp_camera(s: &Sim) -> (Vec<Panel>, Vec<Panel>) {
             ),
             kv1(
                 "Capture",
-                11,
+                16,
                 c.result.clone(),
                 if c.result == "OK" {
                     Color::Green
@@ -471,67 +454,41 @@ fn exp_camera(s: &Sim) -> (Vec<Panel>, Vec<Panel>) {
                 },
             ),
             kv1(
-                "Request",
-                11,
-                if c.request_id == 0 {
-                    "n/a".into()
-                } else {
-                    c.request_id.to_string()
-                },
-                Color::White,
-            ),
-            kv1(
                 "PSRAM object",
-                11,
-                if c.object_id == 0 {
-                    "n/a".into()
-                } else {
+                16,
+                if c.object_id > 0 {
                     c.object_id.to_string()
+                } else {
+                    "n/a".into()
                 },
                 Color::White,
             ),
             kv1(
                 "Saved image",
-                11,
-                if c.saved_file.is_some() {
-                    "saved"
-                } else if c.object_id > 0 {
-                    "waiting for FSW"
-                } else {
-                    "n/a"
-                },
+                16,
+                saved,
                 if c.saved_file.is_some() {
                     Color::Green
                 } else {
-                    Color::Yellow
+                    Color::White
                 },
             ),
             kv1(
-                "MCU frame",
-                11,
-                if c.data_exist { "yes" } else { "no" },
+                "Max temperature",
+                16,
+                temperature(c.peak.map(|p| p.0)),
                 Color::White,
             ),
             kv1(
-                "ROI max",
-                11,
-                c.temp_centi
-                    .map_or("n/a".into(), |v| format!("{:.2} °C", v as f32 / 100.0)),
-                if c.temp_centi.is_some() {
-                    Color::Cyan
-                } else {
-                    Color::DarkGray
-                },
+                "Max position",
+                16,
+                c.peak
+                    .map_or("n/a".into(), |(_, x, y)| format!("({x}, {y})")),
+                Color::White,
             ),
+            kv1("Point max", 16, temperature(c.temp_centi), Color::White),
+            kv1("Point average", 16, temperature(c.mean_centi), Color::White),
         ];
-        if c.temp_centi.is_some() {
-            lines.push(kv1(
-                "Sample tick",
-                11,
-                format!("{} ms", c.sample_ms),
-                Color::DarkGray,
-            ));
-        }
         cards.push(p(
             if i == 0 {
                 "EXP IR CAMERA 0"
@@ -541,30 +498,26 @@ fn exp_camera(s: &Sim) -> (Vec<Panel>, Vec<Panel>) {
             lines,
         ));
     }
-    let mut transfer = vec![
-        Line::from(txt("Capture starts in MCU PSRAM.", Color::White)),
-        Line::from(txt("FSW saves via UART after CRC.", Color::DarkGray)),
-    ];
+    let mut transfer = vec![Line::from(txt("Folder: images/exp", Color::White))];
     for i in 0..2 {
-        transfer.push(Line::from(txt(
-            format!("Camera {i} saved file:"),
-            Color::Cyan,
-        )));
         if let Some(path) = &s.exp.camera[i].saved_file {
             let name = path.rsplit('/').next().unwrap_or(path);
-            let chars: Vec<char> = name.chars().collect();
-            for chunk in chars.chunks(30) {
+            let label = format!("C{i}: {name}");
+            let chars: Vec<char> = label.chars().collect();
+            for chunk in chars.chunks(content_width.max(1)) {
                 transfer.push(Line::from(txt(
                     chunk.iter().collect::<String>(),
                     Color::Green,
                 )));
             }
         } else {
-            transfer.push(Line::from(txt("n/a", Color::DarkGray)));
+            transfer.push(Line::from(txt(
+                format!("Camera {i} saved file: n/a"),
+                Color::White,
+            )));
         }
     }
-    transfer.push(Line::from(txt("Folder: images/exp", Color::DarkGray)));
-    (cards, vec![p("Image transfer", transfer)])
+    (cards, vec![p("IMAGE TRANSFER", transfer)])
 }
 
 fn exp_ir(s: &Sim) -> (Vec<Panel>, Vec<Panel>) {
@@ -632,10 +585,14 @@ fn exp_ir(s: &Sim) -> (Vec<Panel>, Vec<Panel>) {
     )
 }
 
+pub fn draw_burn(f: &mut Frame, st: &State, area: Rect) {
+    let (mut runtime, wires) = exp_burn(&st.sim);
+    runtime.extend(wires);
+    column(f, area, runtime, STATUS_COLOR);
+}
+
 fn exp_burn(s: &Sim) -> (Vec<Panel>, Vec<Panel>) {
     let e = &s.exp;
-    let selected = e.burn_sel;
-    let c = e.burn_setup[selected];
     let remaining = e
         .burn_armed_until
         .filter(|(_, until)| *until > s.t)
@@ -672,93 +629,69 @@ fn exp_burn(s: &Sim) -> (Vec<Panel>, Vec<Panel>) {
             },
             Color::White,
         ),
-        kv1(
-            "Wire 0",
-            12,
-            format!(
-                "{} · {}",
-                if !e.burn_status_seen[0] {
+    ];
+    let mut wires = Vec::new();
+    for selected in 0..2 {
+        let c = e.burn_setup[selected];
+        let config = vec![
+            kv1(
+                "Status",
+                12,
+                if !e.burn_status_seen[selected] {
                     "not read"
-                } else if e.burn_configured[0] {
+                } else if e.burn_configured[selected] {
                     "configured"
                 } else {
                     "incomplete"
                 },
-                e.burn_last[0]
-            ),
-            Color::White,
-        ),
-        kv1(
-            "Wire 1",
-            12,
-            format!(
-                "{} · {}",
-                if !e.burn_status_seen[1] {
-                    "not read"
-                } else if e.burn_configured[1] {
-                    "configured"
+                if e.burn_configured[selected] {
+                    Color::Green
                 } else {
-                    "incomplete"
+                    Color::Yellow
                 },
-                e.burn_last[1]
             ),
-            Color::White,
-        ),
-    ];
-    let config = vec![
-        kv1("Selected", 12, format!("Wire {selected}"), Color::Cyan),
-        kv1(
-            "Status",
-            12,
-            if !e.burn_status_seen[selected] {
-                "not read"
-            } else if e.burn_configured[selected] {
-                "configured"
+            kv1("PWM duty", 12, format!("{}%", c.duty), Color::White),
+            kv1(
+                "Burn time",
+                12,
+                format!("{} ms", c.burn_time_ms),
+                Color::White,
+            ),
+            kv1(
+                "Max total I",
+                12,
+                format!("{} mA", c.max_total_current_ma),
+                Color::White,
+            ),
+            kv1(
+                "Last result",
+                12,
+                e.burn_last[selected].clone(),
+                Color::White,
+            ),
+            kv1(
+                "Attempts",
+                12,
+                e.burn_attempt[selected].to_string(),
+                Color::White,
+            ),
+            kv1(
+                "Peak delta",
+                12,
+                format!("{} mA", e.burn_peak_ma[selected]),
+                Color::White,
+            ),
+        ];
+        wires.push(p(
+            if selected == 0 {
+                "WIRE 0 STATUS"
             } else {
-                "incomplete"
+                "WIRE 1 STATUS"
             },
-            if e.burn_configured[selected] {
-                Color::Green
-            } else {
-                Color::Yellow
-            },
-        ),
-        kv1("PWM duty", 12, format!("{}%", c.duty), Color::White),
-        kv1(
-            "Burn time",
-            12,
-            format!("{} ms", c.burn_time_ms),
-            Color::White,
-        ),
-        kv1(
-            "Max total I",
-            12,
-            format!("{} mA", c.max_total_current_ma),
-            Color::White,
-        ),
-        kv1(
-            "Last result",
-            12,
-            e.burn_last[selected].clone(),
-            Color::White,
-        ),
-        kv1(
-            "Attempts",
-            12,
-            e.burn_attempt[selected].to_string(),
-            Color::White,
-        ),
-        kv1(
-            "Peak delta",
-            12,
-            format!("{} mA", e.burn_peak_ma[selected]),
-            Color::White,
-        ),
-    ];
-    (
-        vec![p("Burn runtime", runtime)],
-        vec![p("Selected wire status", config)],
-    )
+            config,
+        ));
+    }
+    (vec![p("BURN RUNTIME", runtime)], wires)
 }
 
 /// `applied` value with the staged one in yellow while they differ.

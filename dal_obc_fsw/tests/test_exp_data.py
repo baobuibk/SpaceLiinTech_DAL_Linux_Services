@@ -16,10 +16,12 @@ CRC = zlib.crc32(PAYLOAD)
 
 
 class DataExp(ExpModel):
-    def __init__(self, ack_path, corrupt=False):
+    def __init__(self, ack_path, corrupt=False, noisy=False):
         super().__init__()
         self.ack_path = ack_path
         self.corrupt = corrupt
+        self.noisy = noisy
+        self.reads = {}
 
     def __call__(self, command):
         if command == f"data_ready_collect {OBJECT}":
@@ -31,10 +33,16 @@ class DataExp(ExpModel):
             if (int(boot), int(obj)) != (BOOT, OBJECT):
                 return "DATA result=5"
             start, count = int(offset), int(length)
+            self.reads[start] = self.reads.get(start, 0) + 1
+            if self.noisy and start == 32 and self.reads[start] == 1:
+                return "[async] no hex response this time"
             data = PAYLOAD[start:start + count]
             if self.corrupt and start == 32:
                 data = bytes([data[0] ^ 0xFF]) + data[1:]
-            return " ".join(f"{v:02X}" for v in data)
+            hex_line = " ".join(f"{v:02X}" for v in data)
+            if self.noisy:
+                return ("[async] background log\r\n" * 40) + hex_line
+            return hex_line
         if command == f"data_ready_done {BOOT} {OBJECT} {len(PAYLOAD)} {CRC}":
             self.ack_path.write_text("acked")
             return "DATA result=0"
@@ -72,12 +80,12 @@ def make_client(path, ack_path):
 
 
 class ExpDataCollection(unittest.TestCase):
-    def run_case(self, corrupt):
+    def run_case(self, corrupt, noisy=False):
         fsw = Fsw()
         ack = fsw.tmp / "ack"
         client = fsw.tmp / "lite-client"
         make_client(client, ack)
-        fsw.exp_responder = DataExp(ack, corrupt)
+        fsw.exp_responder = DataExp(ack, corrupt, noisy)
         fsw.extra_env = {"DAL_EXP_CSP_ENABLE": "1", "DAL_EXP_CSP_CLIENT": str(client),
                          "DAL_EXP_DATA_ENABLE": "1", "DAL_EXP_DATA_DIR": str(fsw.data_dir)}
         path = fsw.data_dir / "images/exp" / f"EXP_C1_B{BOOT:08X}_O{OBJECT:08X}_E2.bin"
@@ -89,9 +97,13 @@ class ExpDataCollection(unittest.TestCase):
             if corrupt:
                 self.assertFalse(ack.exists(), fsw.log_tail())
                 self.assertFalse(path.exists(), fsw.log_tail())
+                self.assertIn("[EXP-DATA] CRC mismatch:", fsw.log_tail())
             else:
                 self.assertTrue(ack.exists(), fsw.log_tail())
                 self.assertEqual(path.read_bytes(), PAYLOAD)
+                if noisy:
+                    self.assertEqual(fsw.exp_responder.reads, {0: 1, 32: 2, 64: 1})
+                    self.assertIn("retry read:", fsw.log_tail())
                 self.assertIn("data_ready_done", " ".join(fsw.exp.commands))
                 reply = json.loads(fsw.console.run("--json", "exp_csp_snapshot", "6"))
                 snapshot = json.loads(reply["text"])
@@ -105,6 +117,9 @@ class ExpDataCollection(unittest.TestCase):
 
     def test_download_verifies_crc_then_acknowledges(self):
         self.run_case(False)
+
+    def test_noisy_uart_retries_only_failed_chunk(self):
+        self.run_case(False, noisy=True)
 
     def test_corrupt_uart_data_remains_on_mcu(self):
         self.run_case(True)

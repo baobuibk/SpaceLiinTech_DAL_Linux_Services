@@ -5,7 +5,7 @@ use crate::link::Mode;
 use crate::sim::{Level, Sim, Val};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -200,6 +200,12 @@ pub struct LogLine {
     pub text: String,
 }
 
+pub struct BurnRequest {
+    pub wire: usize,
+    pub deadline: Instant,
+    pub fire_selected: bool,
+}
+
 pub struct State {
     pub tab: Tab,
     pub sim: Sim,
@@ -210,6 +216,7 @@ pub struct State {
     /// Last selected control in each of the two visible control panels.
     pub panel_sel: [[[usize; 2]; 9]; 3],
     pub confirm: Option<(Sub, usize)>,
+    pub burn_request: Option<BurnRequest>,
     pub log: Vec<LogLine>,
     pub log_scroll: usize,
     pub cfg_sel: usize,
@@ -230,6 +237,89 @@ pub struct State {
     pub started: Instant,
 }
 
+#[cfg(test)]
+mod burn_request_tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+    fn ready() -> State {
+        let mut st = State::new();
+        st.tab = Tab::Exp;
+        st.page[Sub::Exp.idx()] = 5;
+        st.sim.exp.burn_sel = 1;
+        st.sim.exp.motor = true;
+        st.sim.exp.burn_configured[1] = true;
+        st.sim.exp.burn_setup[1].duty = 25;
+        st.sim.exp.burn_setup[1].burn_time_ms = 100;
+        st.sim.exp.burn_setup[1].max_total_current_ma = 1000;
+        st.sel[Sub::Exp.idx()][5] = Sub::Exp.controls(5).len() - 1;
+        st.on_key(key(KeyCode::Enter));
+        st
+    }
+
+    #[test]
+    fn default_enter_cancels_without_firing() {
+        let mut st = ready();
+        assert!(!st.burn_request.as_ref().unwrap().fire_selected);
+        st.on_key(key(KeyCode::Enter));
+        assert!(st.burn_request.is_none());
+        assert!(st.sim.exp.burn_armed_until.is_none());
+        assert_eq!(st.sim.exp.burn_count, 0);
+    }
+
+    #[test]
+    fn explicit_fire_uses_requested_wire_once() {
+        let mut st = ready();
+        st.on_key(key(KeyCode::Right));
+        st.on_key(key(KeyCode::Enter));
+        assert!(st.burn_request.is_none());
+        assert_eq!(st.sim.exp.burn_active_wire, Some(1));
+        assert_eq!(st.sim.exp.burn_count, 1);
+        st.on_key(key(KeyCode::Enter));
+        assert_eq!(st.sim.exp.burn_count, 1);
+        assert!(st.burn_request.is_none());
+    }
+
+    #[test]
+    fn timeout_cancels_even_when_simulation_is_paused() {
+        let mut st = ready();
+        st.sim.paused = true;
+        st.burn_request.as_mut().unwrap().deadline = Instant::now() - Duration::from_millis(1);
+        st.tick(0.0);
+        assert!(st.burn_request.is_none());
+        assert!(st.sim.exp.burn_armed_until.is_none());
+        assert_eq!(st.sim.exp.burn_count, 0);
+    }
+
+    #[test]
+    fn enter_after_deadline_cannot_fire() {
+        let mut st = ready();
+        st.burn_request.as_mut().unwrap().fire_selected = true;
+        st.burn_request.as_mut().unwrap().deadline = Instant::now() - Duration::from_millis(1);
+        st.on_key(key(KeyCode::Enter));
+        assert!(st.burn_request.is_none());
+        assert_eq!(st.sim.exp.burn_count, 0);
+    }
+
+    #[test]
+    fn fire_requires_matching_arm_and_dialog_blocks_navigation() {
+        let mut st = ready();
+        st.on_key(key(KeyCode::Char('.')));
+        st.on_key(key(KeyCode::Char('3')));
+        assert_eq!(st.page[Sub::Exp.idx()], 5);
+        assert_eq!(st.sim.exp.burn_sel, 1);
+        st.sim.exp.burn_armed_until = Some((0, st.sim.t + 5.0));
+        st.on_key(key(KeyCode::Right));
+        st.on_key(key(KeyCode::Enter));
+        assert_eq!(st.sim.exp.burn_count, 0);
+        assert!(st.burn_request.is_some());
+        st.on_key(key(KeyCode::Esc));
+        assert!(st.burn_request.is_none());
+    }
+}
+
 const LOG_CAP: usize = 500;
 
 #[cfg(test)]
@@ -238,6 +328,74 @@ mod panel_navigation_tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn burn_panels_select_their_wire_and_exit_at_edges() {
+        let mut st = State::new();
+        st.tab = Tab::Exp;
+        st.page[Sub::Exp.idx()] = 5;
+        st.on_key(key(KeyCode::Char('>')));
+        assert_eq!(st.sim.exp.burn_sel, 1);
+        assert_eq!(st.page[Sub::Exp.idx()], 5);
+        st.on_key(key(KeyCode::Down));
+        let wire1_selection = st.sel[Sub::Exp.idx()][5];
+        st.sim.set_num("exp.burn_duty", 37);
+        st.on_key(key(KeyCode::Char('<')));
+        assert_eq!(st.sim.exp.burn_sel, 0);
+        assert_eq!(st.sel[Sub::Exp.idx()][5], 1);
+        assert_eq!(st.sim.exp.burn_setup[1].duty, 37);
+        assert_ne!(st.sim.exp.burn_setup[0].duty, 37);
+        st.on_key(key(KeyCode::Char('<')));
+        assert_eq!(st.page[Sub::Exp.idx()], 4);
+        st.page[Sub::Exp.idx()] = 5;
+        st.on_key(key(KeyCode::Char('>')));
+        assert_eq!(st.sel[Sub::Exp.idx()][5], wire1_selection);
+        st.on_key(key(KeyCode::Char('>')));
+        assert_eq!(st.page[Sub::Exp.idx()], 6);
+    }
+
+    #[test]
+    fn ir_camera_edges_navigate_to_adjacent_pages() {
+        let mut st = State::new();
+        st.tab = Tab::Exp;
+        st.page[Sub::Exp.idx()] = 8;
+        for camera in &st.sim.exp.camera {
+            assert_eq!(camera.model, 0);
+            assert_eq!(camera.address, 51);
+        }
+        st.on_key(key(KeyCode::Char('<')));
+        assert_eq!(st.page[Sub::Exp.idx()], 7);
+        st.page[Sub::Exp.idx()] = 8;
+        st.on_key(key(KeyCode::Char('>')));
+        assert_eq!(st.page[Sub::Exp.idx()], 8);
+        assert_eq!(st.sim.exp.cam_sel, 1);
+        st.on_key(key(KeyCode::Char('>')));
+        assert_eq!(st.page[Sub::Exp.idx()], 0);
+    }
+
+    #[test]
+    fn ir_camera_focus_keeps_drafts_and_selection_separate() {
+        let mut st = State::new();
+        st.tab = Tab::Exp;
+        st.page[Sub::Exp.idx()] = 8;
+        st.on_key(key(KeyCode::Down));
+        let first = st.sel[Sub::Exp.idx()][8];
+        st.sim.exp.camera[0].address = 51;
+        st.sim.exp.camera[1].address = 102;
+        st.on_key(key(KeyCode::Char('>')));
+        assert_eq!(st.sim.exp.cam_sel, 1);
+        assert_eq!(st.page[Sub::Exp.idx()], 8);
+        st.on_key(key(KeyCode::Down));
+        st.on_key(key(KeyCode::Down));
+        let second = st.sel[Sub::Exp.idx()][8];
+        st.on_key(key(KeyCode::Char('<')));
+        assert_eq!(st.sim.exp.cam_sel, 0);
+        assert_eq!(st.sel[Sub::Exp.idx()][8], first);
+        st.on_key(key(KeyCode::Char('>')));
+        assert_eq!(st.sel[Sub::Exp.idx()][8], second);
+        assert_eq!(st.sim.exp.camera[0].address, 51);
+        assert_eq!(st.sim.exp.camera[1].address, 102);
     }
 
     #[test]
@@ -395,6 +553,7 @@ fn panel_of(sub: Sub, page: usize, index: usize) -> usize {
 
 fn panel_indices(sub: Sub, page: usize, panel: usize) -> Vec<usize> {
     (0..sub.controls(page).len())
+        .filter(|&i| !(sub == Sub::Exp && matches!(page, 5 | 8) && i == 0))
         .filter(|&i| panel_of(sub, page, i) == panel)
         .collect()
 }
@@ -408,6 +567,7 @@ impl State {
             sel: [[0; 9]; 3],
             panel_sel: [[[0; 2]; 9]; 3],
             confirm: None,
+            burn_request: None,
             log: Vec::new(),
             log_scroll: 0,
             cfg_sel: 0,
@@ -432,6 +592,96 @@ impl State {
 
     pub fn tick(&mut self, dt: f64) {
         self.sim.tick(dt);
+        self.expire_burn_request();
+        self.pump_logs();
+    }
+
+    fn cancel_burn_request(&mut self, message: &str) {
+        if self.burn_request.take().is_some() {
+            // Disarm even if the ARM response is still in flight. Commands are serialized.
+            self.sim.run("exp.burn_abort");
+            self.push_local(Sub::Exp, Level::Info, message);
+        }
+    }
+
+    fn expire_burn_request(&mut self) -> bool {
+        if self
+            .burn_request
+            .as_ref()
+            .is_some_and(|r| Instant::now() >= r.deadline)
+        {
+            self.cancel_burn_request("Burn request expired; cancelled");
+            return true;
+        }
+        false
+    }
+
+    fn begin_burn_request(&mut self) {
+        if self.burn_request.is_some() {
+            return;
+        }
+        if matches!(
+            self.sim.exp.burn_state.as_str(),
+            "FIRING" | "POST_MONITOR" | "ARMED"
+        ) {
+            self.push_local(
+                Sub::Exp,
+                Level::Warn,
+                "Burn request refused: burn operation already active",
+            );
+            return;
+        }
+        self.burn_request = Some(BurnRequest {
+            wire: self.sim.exp.burn_sel,
+            deadline: Instant::now() + Duration::from_secs(5),
+            fire_selected: false,
+        });
+        self.sim.run("exp.burn_arm");
+    }
+
+    fn burn_request_key(&mut self, k: KeyEvent) {
+        if self.expire_burn_request() {
+            return;
+        }
+        let Some(request) = self.burn_request.as_mut() else {
+            return;
+        };
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.cancel_burn_request("Burn request cancelled"),
+            KeyCode::Left
+            | KeyCode::Up
+            | KeyCode::Char('<')
+            | KeyCode::Char('h')
+            | KeyCode::Char('k') => request.fire_selected = false,
+            KeyCode::Right
+            | KeyCode::Down
+            | KeyCode::Char('>')
+            | KeyCode::Char('l')
+            | KeyCode::Char('j') => request.fire_selected = true,
+            KeyCode::Tab | KeyCode::BackTab => request.fire_selected = !request.fire_selected,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if !request.fire_selected {
+                    self.cancel_burn_request("Burn request cancelled");
+                } else if self.sim.exp.burn_sel != request.wire
+                    || !self
+                        .sim
+                        .exp
+                        .burn_armed_until
+                        .is_some_and(|(wire, until)| wire == request.wire && self.sim.t < until)
+                {
+                    self.push_local(
+                        Sub::Exp,
+                        Level::Warn,
+                        "FIRE unavailable: waiting for a valid arm confirmation",
+                    );
+                } else {
+                    // Consume the dialog before dispatch, so repeat keys cannot fire twice.
+                    self.burn_request = None;
+                    self.sim.run("exp.burn");
+                }
+            }
+            _ => {}
+        }
         self.pump_logs();
     }
 
@@ -761,6 +1011,10 @@ impl State {
     }
 
     pub fn on_key(&mut self, k: KeyEvent) {
+        if self.burn_request.is_some() {
+            self.burn_request_key(k);
+            return;
+        }
         if let Some(buf) = self.pc_name_edit.as_mut() {
             match k.code {
                 KeyCode::Esc => self.pc_name_edit = None,
@@ -998,6 +1252,9 @@ impl State {
         let si = sub.idx();
         let np = sub.pages().len() as isize;
         let pg = self.page[si];
+        if sub == Sub::Exp && matches!(pg, 5 | 8) {
+            self.sel[si][pg] = self.sel[si][pg].max(1);
+        }
         let cur = self.sel[si][pg];
         let panel = panel_of(sub, pg, cur);
         let indices = panel_indices(sub, pg, panel);
@@ -1036,7 +1293,13 @@ impl State {
         let new_page = self.page[si];
         if new_page == pg {
             let selected = self.sel[si][pg];
-            let selected_panel = panel_of(sub, pg, selected);
+            let selected_panel = if sub == Sub::Exp && pg == 8 {
+                self.sim.exp.cam_sel
+            } else if sub == Sub::Exp && pg == 5 {
+                self.sim.exp.burn_sel
+            } else {
+                panel_of(sub, pg, selected)
+            };
             self.panel_sel[si][pg][selected_panel] = selected;
         }
         if sub == Sub::Exp && self.page[si] != pg && self.sim.live.mode != Mode::Sim {
@@ -1077,6 +1340,28 @@ impl State {
     fn move_panel(&mut self, sub: Sub, direction: isize) {
         let si = sub.idx();
         let page = self.page[si];
+        if sub == Sub::Exp && matches!(page, 5 | 8) {
+            let current = if page == 8 {
+                self.sim.exp.cam_sel
+            } else {
+                self.sim.exp.burn_sel
+            };
+            self.panel_sel[si][page][current] = self.sel[si][page].max(1);
+            let next = current as isize + direction;
+            if !(0..2).contains(&next) {
+                self.page[si] =
+                    (page as isize + direction).rem_euclid(sub.pages().len() as isize) as usize;
+                return;
+            }
+            let next = next as usize;
+            if page == 8 {
+                self.sim.exp.cam_sel = next;
+            } else {
+                self.sim.exp.burn_sel = next;
+            }
+            self.sel[si][page] = self.panel_sel[si][page][next].max(1);
+            return;
+        }
         let count = panel_count(sub, page);
         let current = panel_of(sub, page, self.sel[si][page]);
         let next = current as isize + direction;
@@ -1121,7 +1406,9 @@ impl State {
                 }
             }
             Kind::Action => {
-                if c.id == "obc.rtc_set" {
+                if c.id == "exp.burn_request" {
+                    self.begin_burn_request();
+                } else if c.id == "obc.rtc_set" {
                     self.rtc_edit = Some(crate::sim::civil(self.sim.rtc_now()));
                 } else if c.id == "exp.pc_name" {
                     if self.sim.exp.pc_target == 0 {

@@ -17,23 +17,12 @@ use ratatui::{prelude::*, widgets::*};
 
 // ── Colors ────────────────────────────────────────────────────────────────────
 
-pub fn tab_color(tab: Tab) -> Color {
-    match tab {
-        Tab::Home => Color::Green,
-        Tab::Obc => Color::Cyan,
-        Tab::Exp => Color::LightGreen,
-        Tab::Pdu => Color::LightYellow,
-        Tab::Log => Color::Magenta,
-        Tab::Cfg => Color::LightBlue,
-    }
+pub fn tab_color(_tab: Tab) -> Color {
+    Color::Blue
 }
 
-pub fn sub_color(sub: Sub) -> Color {
-    match sub {
-        Sub::Obc => Color::Cyan,
-        Sub::Exp => Color::LightGreen,
-        Sub::Pdu => Color::LightYellow,
-    }
+pub fn sub_color(_sub: Sub) -> Color {
+    Color::Blue
 }
 
 pub fn level_color(l: Level) -> Color {
@@ -198,7 +187,89 @@ pub fn rails_total(rails: &[Rail]) -> f32 {
     rails.iter().map(|r| r.mw()).sum::<i32>() as f32 / 1000.0
 }
 
-pub fn panel(f: &mut Frame, area: Rect, title: &str, color: Color, lines: Vec<Line<'static>>) {
+pub fn control_color(active: bool) -> Color {
+    if active {
+        Color::Green
+    } else {
+        Color::Gray
+    }
+}
+
+/// Dark neutral background from the 256-color palette (#262626).
+pub fn control_focus_style() -> Style {
+    Style::default()
+        .fg(Color::Green)
+        .bg(Color::Indexed(235))
+        .add_modifier(Modifier::BOLD)
+}
+
+pub const STATUS_COLOR: Color = Color::LightBlue;
+
+pub fn panel(f: &mut Frame, area: Rect, title: &str, _color: Color, lines: Vec<Line<'static>>) {
+    let lines = status_lines(lines);
+    framed_panel(f, area, title, STATUS_COLOR, lines);
+}
+
+/// Semantic status colors; ordinary telemetry remains white.
+pub fn status_value_color(text: &str, original: Option<Color>) -> Color {
+    let value = text.trim().to_ascii_lowercase();
+    let words: Vec<&str> = value.split(|c: char| !c.is_ascii_alphanumeric()).collect();
+    if original == Some(Color::Red)
+        || words.iter().any(|w| {
+            matches!(
+                *w,
+                "error"
+                    | "failed"
+                    | "failure"
+                    | "fault"
+                    | "err"
+                    | "timeout"
+                    | "invalid"
+                    | "rejected"
+                    | "aborted"
+            )
+        })
+    {
+        Color::Red
+    } else if words.iter().any(|w| {
+        matches!(
+            *w,
+            "waiting" | "pending" | "queued" | "busy" | "capturing" | "loading" | "starting"
+        )
+    }) {
+        Color::Magenta
+    } else if matches!(
+        value.as_str(),
+        "ok" | "done" | "saved" | "complete" | "completed" | "success"
+    ) || original == Some(Color::Green)
+    {
+        Color::Indexed(153)
+    } else if original == Some(Color::Yellow)
+        || words.iter().any(|w| matches!(*w, "warning" | "warn"))
+    {
+        Color::Yellow
+    } else {
+        Color::White
+    }
+}
+
+pub fn status_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    for line in &mut lines {
+        line.style = line.style.fg(Color::White);
+        for span in &mut line.spans {
+            span.style = span
+                .style
+                .fg(status_value_color(&span.content, span.style.fg));
+        }
+    }
+    lines
+}
+
+pub fn control_panel(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) {
+    framed_panel(f, area, title, control_color(true), lines);
+}
+
+fn framed_panel(f: &mut Frame, area: Rect, title: &str, color: Color, lines: Vec<Line<'static>>) {
     let block = Block::bordered()
         .border_style(Style::default().fg(color))
         .title(Span::styled(
@@ -240,6 +311,9 @@ pub fn draw(f: &mut Frame, st: &mut State) {
     draw_status_line(f, st, chunks[3]);
     draw_footer(f, st, chunks[4]);
 
+    if let Some(request) = &st.burn_request {
+        draw_burn_request(f, area, request, st);
+    }
     if let Some((sub, i)) = st.confirm {
         draw_confirm(f, area, sub, sub.controls(st.page[sub.idx()])[i].label);
     }
@@ -258,6 +332,63 @@ pub fn draw(f: &mut Frame, st: &mut State) {
     if let Some((id, draft)) = &st.choice_edit {
         draw_choice_editor(f, area, id, *draft);
     }
+}
+
+fn draw_burn_request(f: &mut Frame, area: Rect, request: &crate::app::BurnRequest, st: &State) {
+    let width = 48.min(area.width);
+    let height = 9.min(area.height);
+    let rect = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    let left = request
+        .deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs_f64()
+        .ceil() as u32;
+    let armed = st
+        .sim
+        .exp
+        .burn_armed_until
+        .is_some_and(|(wire, until)| wire == request.wire && st.sim.t < until);
+    let button = |label: &str, selected: bool| {
+        Span::styled(
+            format!(" {} {label} ", if selected { "▶" } else { " " }),
+            if selected {
+                control_focus_style()
+            } else {
+                Style::default().fg(Color::White)
+            },
+        )
+    };
+    let lines = vec![
+        Line::raw(format!(" Wire {}  |  Expires in {left}s", request.wire)),
+        Line::from(txt(
+            if armed {
+                " ARMED"
+            } else {
+                " Waiting for arm confirmation"
+            },
+            if armed {
+                Color::LightBlue
+            } else {
+                Color::Magenta
+            },
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            button("CANCEL", !request.fire_selected),
+            Span::raw("    "),
+            button("FIRE", request.fire_selected),
+        ]),
+        Line::raw(""),
+        Line::raw(" Arrows/Tab: select  Enter: confirm"),
+        Line::raw(" Esc: cancel"),
+    ];
+    f.render_widget(Clear, rect);
+    control_panel(f, rect, "Burn request", lines);
 }
 
 fn draw_number_editor(f: &mut Frame, area: Rect, id: &str, value: &str, replace: bool) {
@@ -285,7 +416,7 @@ fn draw_number_editor(f: &mut Frame, area: Rect, id: &str, value: &str, replace:
             } else {
                 format!(" {value}_ {unit}")
             },
-            Color::Yellow,
+            Color::Green,
         )),
         Line::raw(""),
         Line::raw(" Type: replace   Enter: stage   Esc: cancel"),
@@ -294,7 +425,7 @@ fn draw_number_editor(f: &mut Frame, area: Rect, id: &str, value: &str, replace:
         Paragraph::new(lines).block(
             Block::bordered()
                 .title(" Edit value ")
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(Color::Green)),
         ),
         r,
     );
@@ -321,7 +452,7 @@ fn draw_choice_editor(f: &mut Frame, area: Rect, id: &str, draft: usize) {
         lines.push(Line::from(txt(
             format!(" {} {}", if i == draft { '▶' } else { ' ' }, option),
             if i == draft {
-                Color::Yellow
+                Color::Green
             } else {
                 Color::White
             },
@@ -333,7 +464,7 @@ fn draw_choice_editor(f: &mut Frame, area: Rect, id: &str, draft: usize) {
         Paragraph::new(lines).block(
             Block::bordered()
                 .title(" Select value ")
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(Color::Green)),
         ),
         r,
     );
@@ -352,7 +483,7 @@ fn draw_pwm_editor(f: &mut Frame, area: Rect, value: &str) {
     let lines = vec![
         Line::raw(" PWM frequency (100–100000 Hz)"),
         Line::raw(""),
-        Line::from(txt(format!(" {value}_ Hz"), Color::Yellow)),
+        Line::from(txt(format!(" {value}_ Hz"), Color::Green)),
         Line::raw(""),
         Line::raw(" Enter: stage value   Ctrl+U: clear   Esc: cancel"),
     ];
@@ -360,7 +491,7 @@ fn draw_pwm_editor(f: &mut Frame, area: Rect, value: &str) {
         Paragraph::new(lines).block(
             Block::bordered()
                 .title(" IR PWM frequency ")
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(Color::Green)),
         ),
         r,
     );
@@ -379,7 +510,7 @@ fn draw_pc_name_editor(f: &mut Frame, area: Rect, value: &str) {
     let lines = vec![
         Line::raw(" Profile name (1–23 ASCII characters, no spaces)"),
         Line::raw(""),
-        Line::from(txt(format!(" {value}_"), Color::Yellow)),
+        Line::from(txt(format!(" {value}_"), Color::Green)),
         Line::raw(""),
         Line::raw(" Enter: stage name   Ctrl+U: clear   Esc: cancel"),
     ];
@@ -387,7 +518,7 @@ fn draw_pc_name_editor(f: &mut Frame, area: Rect, value: &str) {
         Paragraph::new(lines).block(
             Block::bordered()
                 .title(" PC profile name ")
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(Color::Green)),
         ),
         r,
     );
@@ -406,7 +537,7 @@ fn draw_rtc_editor(f: &mut Frame, area: Rect, value: &str) {
     let lines = vec![
         Line::raw(" UTC time (YYYY-MM-DD HH:MM:SS)"),
         Line::raw(""),
-        Line::from(txt(format!(" {value}_"), Color::Yellow)),
+        Line::from(txt(format!(" {value}_"), Color::Green)),
         Line::raw(""),
         Line::raw(" Enter: set RTC   Ctrl+U: clear   Esc: cancel"),
     ];
@@ -414,7 +545,7 @@ fn draw_rtc_editor(f: &mut Frame, area: Rect, value: &str) {
         Paragraph::new(lines).block(
             Block::bordered()
                 .title(" Set Time ")
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(Color::Green)),
         ),
         r,
     );
@@ -432,6 +563,30 @@ fn draw_subsystem(f: &mut Frame, st: &State, sub: Sub, area: Rect) {
     }
     if sub == Sub::Obc && st.page[sub.idx()] == 1 {
         camera::draw(f, st, rows[1]);
+        return;
+    }
+    if sub == Sub::Exp && st.page[sub.idx()] == 5 {
+        let cols = Layout::horizontal([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(rows[1]);
+        panels::draw_burn(f, st, cols[0]);
+        controls::draw_burn(f, st, cols[1], 0);
+        controls::draw_burn(f, st, cols[2], 1);
+        return;
+    }
+    if sub == Sub::Exp && st.page[sub.idx()] == 8 {
+        let cols = Layout::horizontal([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(rows[1]);
+        panels::draw_exp_camera(f, st, cols[0]);
+        controls::draw_exp_camera(f, st, cols[1], 0);
+        controls::draw_exp_camera(f, st, cols[2], 1);
         return;
     }
     if sub == Sub::Exp && st.page[sub.idx()] == 4 {
@@ -476,7 +631,7 @@ fn draw_pages(f: &mut Frame, st: &State, sub: Sub, area: Rect) {
         let style = if i == cur {
             Style::default()
                 .bg(color)
-                .fg(Color::Black)
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
@@ -572,7 +727,7 @@ fn draw_tabs(f: &mut Frame, st: &State, area: Rect) {
         let style = if tab == st.tab {
             Style::default()
                 .bg(tab_color(tab))
-                .fg(Color::Black)
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD)
         } else {
             // Tabs of a subsystem with a problem get a colored label.
@@ -704,7 +859,7 @@ fn draw_footer(f: &mut Frame, st: &State, area: Rect) {
             badge,
             Style::default()
                 .bg(tab_color(st.tab))
-                .fg(Color::Black)
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )),
         cols[0],
@@ -754,4 +909,48 @@ fn draw_confirm(f: &mut Frame, area: Rect, sub: Sub, label: &str) {
             .block(block),
         r,
     );
+}
+
+#[cfg(test)]
+mod camera_layout_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn status_semantics_override_generic_colors() {
+        let lines = status_lines(vec![Line::from(vec![
+            txt("waiting for FSW", Color::Yellow),
+            txt("OK", Color::White),
+            txt("ERROR capture failed", Color::Yellow),
+            txt("warning", Color::White),
+            txt("51 dec", Color::White),
+        ])]);
+        let colors: Vec<_> = lines[0].spans.iter().map(|s| s.style.fg.unwrap()).collect();
+        assert_eq!(
+            colors,
+            vec![
+                Color::Magenta,
+                Color::Indexed(153),
+                Color::Red,
+                Color::Yellow,
+                Color::White
+            ]
+        );
+    }
+
+    #[test]
+    fn camera_borders_distinguish_status_and_focused_control() {
+        let mut st = State::new();
+        st.tab = Tab::Exp;
+        st.page[Sub::Exp.idx()] = 8;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        for channel in 0..2 {
+            st.sim.exp.cam_sel = channel;
+            terminal.draw(|f| draw(f, &mut st)).unwrap();
+            let b = terminal.backend().buffer();
+            assert_eq!(b[(0, 5)].fg, STATUS_COLOR);
+            assert_eq!(b[(41, 5)].fg, control_color(channel == 0));
+            assert_eq!(b[(80, 5)].fg, control_color(channel == 1));
+        }
+    }
 }

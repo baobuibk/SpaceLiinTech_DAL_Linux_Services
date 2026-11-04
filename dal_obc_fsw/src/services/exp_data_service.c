@@ -65,9 +65,30 @@ static int mkdirs(const char *path)
     }
 }
 
+/* Keep UART control characters visible in a single journal record. */
+static void log_reply(const char *reply)
+{
+    for (size_t i = 0; reply[i] && i < 1024; ++i) {
+        unsigned char c = (unsigned char)reply[i];
+        if (c == '\r') fputs("\\r", stderr);
+        else if (c == '\n') fputs("\\n", stderr);
+        else if (c < 32 || c >= 127) fprintf(stderr, "\\x%02X", c);
+        else fputc(c, stderr);
+    }
+    fputc('\n', stderr);
+}
+
 static int command(const char *line, char *reply, size_t cap)
 {
-    return exp_uart_command(line, reply, cap) == 0 && !strstr(reply, "ERROR") ? 0 : -1;
+    reply[0] = '\0';
+    int status = exp_uart_command(line, reply, cap);
+    if (status != 0 || strstr(reply, "ERROR")) {
+        fprintf(stderr, "[EXP-DATA] command failed: %s; UART status=%d reply=",
+                line, status);
+        log_reply(reply);
+        return -1;
+    }
+    return 0;
 }
 
 static int parse_descriptor(const char *reply, descriptor_t *d)
@@ -97,21 +118,43 @@ static int parse_hex_line(const char *line, unsigned length, uint8_t out[READ_CH
     return *line == '\0' || *line == '\r' ? 0 : -1;
 }
 
-static int read_chunk(const descriptor_t *d, uint32_t offset,
+static int read_chunk_once(const descriptor_t *d, uint32_t offset,
                       unsigned length, uint8_t out[READ_CHUNK])
 {
-    char line[96], reply[512];
+    char line[96], reply[4096];
     snprintf(line, sizeof(line), "data_read %u %u %u %u", d->boot, d->object,
              offset, length);
     if (command(line, reply, sizeof(reply))) return -1;
     for (char *p = reply; *p;) {
         char *end = strchr(p, '\n');
-        if (!end) break;
+        if (!end) {
+            if (parse_hex_line(p, length, out) == 0) return 0;
+            break;
+        }
         char save = *end;
         *end = '\0';
         if (parse_hex_line(p, length, out) == 0) { *end = save; return 0; }
         *end = save;
         p = end + 1;
+    }
+    fprintf(stderr, "[EXP-DATA] invalid read reply: boot=%u object=%u offset=%u length=%u reply=",
+            d->boot, d->object, offset, length);
+    log_reply(reply);
+    return -1;
+}
+
+/* data_read is read-only: retry the same range, never advance on failure. */
+static int read_chunk(const descriptor_t *d, uint32_t offset,
+                      unsigned length, uint8_t out[READ_CHUNK])
+{
+    for (unsigned attempt = 0; attempt < 3 && atomic_load(&running); ++attempt) {
+        if (read_chunk_once(d, offset, length, out) == 0) return 0;
+        if (attempt < 2) {
+            fprintf(stderr, "[EXP-DATA] retry read: object=%u offset=%u attempt=%u/3\n",
+                    d->object, offset, attempt + 2);
+            struct timespec delay = {.tv_sec = 0, .tv_nsec = 100000000L};
+            nanosleep(&delay, NULL);
+        }
     }
     return -1;
 }
@@ -143,7 +186,10 @@ static int save_object(const descriptor_t *d, const char *path)
     char temp[640];
     if (snprintf(temp, sizeof(temp), "%s.part.XXXXXX", path) >= (int)sizeof(temp)) return -1;
     int fd = mkstemp(temp);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        fprintf(stderr, "[EXP-DATA] cannot create %s: %s\n", temp, strerror(errno));
+        return -1;
+    }
     fchmod(fd, 0644);
     uint32_t crc = bee_dal_crc32_init();
     int ok = 1;
@@ -160,7 +206,12 @@ static int save_object(const descriptor_t *d, const char *path)
         crc = bee_dal_crc32_update(crc, bytes, count);
         offset += count;
     }
-    if (bee_dal_crc32_finalize(crc) != d->crc32 || fsync(fd)) ok = 0;
+    if (ok && bee_dal_crc32_finalize(crc) != d->crc32) {
+        fprintf(stderr, "[EXP-DATA] CRC mismatch: object=%u expected=%08X calculated=%08X\n",
+                d->object, d->crc32, bee_dal_crc32_finalize(crc));
+        ok = 0;
+    }
+    if (fsync(fd)) { fprintf(stderr, "[EXP-DATA] fsync %s: %s\n", temp, strerror(errno)); ok = 0; }
     if (close(fd)) ok = 0;
     if (ok && rename(temp, path) == 0) {
         char parent[640];
@@ -189,11 +240,19 @@ static int collect(const HkExpInventory *inventory)
         d.source != inventory->source || d.encoding != inventory->encoding ||
         d.width != inventory->width || d.height != inventory->height ||
         d.length == 0 || d.length > MAX_OBJECT || d.type < 1 || d.type > 3 ||
-        (d.type == 3 && d.source > 1)) return -1;
+        (d.type == 3 && d.source > 1)) {
+        fprintf(stderr, "[EXP-DATA] descriptor invalid or differs from table 6: boot=%u object=%u length=%u CRC=%08X type=%u source=%u encoding=%u size=%ux%u reply=%.350s\n",
+                inventory->boot_id, inventory->object_id, inventory->length, inventory->crc32,
+                inventory->type, inventory->source, inventory->encoding, inventory->width, inventory->height, reply);
+        return -1;
+    }
     const char *subdir = d.type == 3 ? "images/exp" :
                          d.type == 2 ? "logs/pc" : "logs/lwl";
     if (snprintf(folder, sizeof(folder), "%s/%s", data_root, subdir) >= (int)sizeof(folder) ||
-        mkdirs(folder)) return -1;
+        mkdirs(folder)) {
+        fprintf(stderr, "[EXP-DATA] cannot create destination %s: %s\n", folder, strerror(errno));
+        return -1;
+    }
     if (d.type == 3)
         snprintf(name, sizeof(name), "EXP_C%u_B%08X_O%08X_E%u.bin",
                  d.source, d.boot, d.object, d.encoding);
@@ -210,7 +269,10 @@ static int collect(const HkExpInventory *inventory)
     pthread_mutex_unlock(&saved_lock);
     snprintf(line, sizeof(line), "data_ready_done %u %u %u %u",
              d.boot, d.object, d.length, d.crc32);
-    if (command(line, reply, sizeof(reply)) || !strstr(reply, "DATA result=0")) return -1;
+    if (command(line, reply, sizeof(reply)) || !strstr(reply, "DATA result=0")) {
+        fprintf(stderr, "[EXP-DATA] file saved but ACK failed: %s reply=%.300s\n", path, reply);
+        return -1;
+    }
     fprintf(stderr, "[EXP-DATA] saved %s (%u bytes, CRC32=%08X)\n",
             path, d.length, d.crc32);
     return 0;

@@ -390,8 +390,7 @@ pub struct IrCamera {
     pub emissivity: i32,
     pub x: i32,
     pub y: i32,
-    pub width: i32,
-    pub height: i32,
+    pub delta: i32,
     pub initialized: bool,
     pub buffer_enabled: Option<bool>,
     pub data_exist: bool,
@@ -400,6 +399,8 @@ pub struct IrCamera {
     pub saved_file: Option<String>,
     pub result: String,
     pub temp_centi: Option<i32>,
+    pub mean_centi: Option<i32>,
+    pub peak: Option<(i32, u8, u8)>,
     pub sample_ms: u32,
     pub confirmed: bool,
     pub actual_model: usize,
@@ -409,18 +410,34 @@ pub struct IrCamera {
     pub address_restart_required: bool,
 }
 
+impl IrCamera {
+    /// Inclusive square around the center, clipped to the 32x24 sensor.
+    pub fn point_region(&self) -> Option<(i32, i32, i32, i32)> {
+        if !(0..32).contains(&self.x)
+            || !(0..24).contains(&self.y)
+            || !(0..=31).contains(&self.delta)
+        {
+            return None;
+        }
+        let x0 = (self.x - self.delta).max(0);
+        let y0 = (self.y - self.delta).max(0);
+        let x1 = (self.x + self.delta).min(31);
+        let y1 = (self.y + self.delta).min(23);
+        Some((x0, y0, x1 - x0 + 1, y1 - y0 + 1))
+    }
+}
+
 impl Default for IrCamera {
     fn default() -> Self {
         Self {
-            model: 1,
-            address: 0x66,
+            model: 0,
+            address: 0x33,
             format: 1,
             hz: 2,
             emissivity: 1000,
             x: 0,
             y: 0,
-            width: 32,
-            height: 24,
+            delta: 0,
             initialized: false,
             buffer_enabled: None,
             data_exist: false,
@@ -429,6 +446,8 @@ impl Default for IrCamera {
             saved_file: None,
             result: "not read".into(),
             temp_centi: None,
+            mean_centi: None,
+            peak: None,
             sample_ms: 0,
             confirmed: false,
             actual_model: 0,
@@ -443,6 +462,27 @@ impl Default for IrCamera {
 #[cfg(test)]
 mod ir_camera_tests {
     use super::*;
+
+    #[test]
+    fn point_square_clips_each_corner_and_includes_both_endpoints() {
+        let mut c = IrCamera::default();
+        c.delta = 2;
+        for (x, y, expected) in [
+            (10, 10, (8, 8, 5, 5)),
+            (0, 0, (0, 0, 3, 3)),
+            (31, 0, (29, 0, 3, 3)),
+            (0, 23, (0, 21, 3, 3)),
+            (31, 23, (29, 21, 3, 3)),
+        ] {
+            c.x = x;
+            c.y = y;
+            assert_eq!(c.point_region(), Some(expected));
+        }
+        c.delta = 0;
+        assert_eq!(c.point_region(), Some((31, 23, 1, 1)));
+        c.delta = 31;
+        assert_eq!(c.point_region(), Some((0, 0, 32, 24)));
+    }
 
     #[test]
     fn capture_requires_init_and_measurement_requires_capture() {
@@ -1344,8 +1384,7 @@ impl Sim {
             "exp.cam_emiss" => Val::Num(e.camera[e.cam_sel].emissivity),
             "exp.cam_x" => Val::Num(e.camera[e.cam_sel].x),
             "exp.cam_y" => Val::Num(e.camera[e.cam_sel].y),
-            "exp.cam_w" => Val::Num(e.camera[e.cam_sel].width),
-            "exp.cam_h" => Val::Num(e.camera[e.cam_sel].height),
+            "exp.cam_delta" => Val::Num(e.camera[e.cam_sel].delta),
             "exp.burn_sel" => Val::Idx(e.burn_sel),
             "exp.burn_duty" => Val::Num(e.burn_setup[e.burn_sel].duty),
             "exp.burn_time" => Val::Num(e.burn_setup[e.burn_sel].burn_time_ms),
@@ -1592,10 +1631,17 @@ impl Sim {
             "exp.ht_duty" => return self.exp.ht_profile[self.exp.ht_sel].duty = v,
             "exp.cam_addr" => return self.exp.camera[self.exp.cam_sel].address = v,
             "exp.cam_emiss" => return self.exp.camera[self.exp.cam_sel].emissivity = v,
-            "exp.cam_x" => return self.exp.camera[self.exp.cam_sel].x = v,
-            "exp.cam_y" => return self.exp.camera[self.exp.cam_sel].y = v,
-            "exp.cam_w" => return self.exp.camera[self.exp.cam_sel].width = v,
-            "exp.cam_h" => return self.exp.camera[self.exp.cam_sel].height = v,
+            "exp.cam_x" | "exp.cam_y" | "exp.cam_delta" => {
+                let c = &mut self.exp.camera[self.exp.cam_sel];
+                match id {
+                    "exp.cam_x" => c.x = v,
+                    "exp.cam_y" => c.y = v,
+                    _ => c.delta = v,
+                }
+                c.temp_centi = None;
+                c.mean_centi = None;
+                return;
+            }
             "exp.ht_duration" => return self.exp.ht_profile[self.exp.ht_sel].duration = v,
             "exp.ht_max_duty" => return self.exp.ht_profile[self.exp.ht_sel].max_duty = v,
             "exp.ht_manual_slew" => return self.exp.ht_profile[self.exp.ht_sel].manual_slew = v,
@@ -1908,6 +1954,8 @@ impl Sim {
                 c.data_exist = true;
                 c.result = "OK".into();
                 c.temp_centi = None;
+                c.mean_centi = None;
+                c.peak = Some((2570 + i as i32 * 100, 31, 23));
                 let object_id = c.object_id;
                 self.log(
                     Sub::Exp,
@@ -1923,23 +1971,36 @@ impl Sim {
                     format!("camera_status {i}: {}", self.exp.camera[i].result),
                 );
             }
-            "exp.cam_temp" => {
+            "exp.cam_temp" | "exp.cam_mean" => {
                 let i = self.exp.cam_sel;
                 let c = &mut self.exp.camera[i];
-                if !c.data_exist || c.x + c.width > 32 || c.y + c.height > 24 {
+                let Some((x, y, w, h)) = c.point_region().filter(|_| c.data_exist) else {
                     return self.log(
                         Sub::Exp,
                         Level::Warn,
-                        "camera_temp: capture first and use an ROI within 32x24",
+                        "Point measurement: capture a frame first",
                     );
+                };
+                let mean = id == "exp.cam_mean";
+                let temperature = if mean {
+                    2400 + i as i32 * 100 + (2 * x + w - 1) * 2 + (2 * y + h - 1)
+                } else {
+                    2400 + i as i32 * 100 + (x + w - 1) * 4 + (y + h - 1) * 2
+                };
+                if mean {
+                    c.mean_centi = Some(temperature);
+                } else {
+                    c.temp_centi = Some(temperature);
                 }
-                c.temp_centi = Some(2400 + (i as i32) * 100 + c.x * 4 + c.y * 2);
                 c.sample_ms = (self.t * 1000.0) as u32;
-                let temp = c.temp_centi.unwrap() as f32 / 100.0;
                 self.log(
                     Sub::Exp,
                     Level::Ok,
-                    format!("camera_temp {i}: ROI max {temp:.2} °C"),
+                    format!(
+                        "Point {}: {:.2} °C",
+                        if mean { "average" } else { "max" },
+                        temperature as f32 / 100.0
+                    ),
                 );
             }
             "obc.capture" => {

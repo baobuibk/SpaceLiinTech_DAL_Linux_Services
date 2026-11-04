@@ -62,7 +62,7 @@ OBC and EXP tabs have several pages, switched with `<` / `>` (or `,` / `.`). The
 | --- | --- |
 | HOME | **Housekeeping** strip (Update Housekeeping AUTO / MANUAL and the UPDATE button), then three cards (OBC, EXP, PDU) with health badge and key telemetry |
 | OBC | **Overview**: system, devices, temperatures, 8 PAC1934 rails; eFuses, editable UTC Set Time, reboot. **Camera**: USB controls and JPEG capture on the left; CAMERA_LED PWM, four USB power switches, and camera selection. MIPI controls and PNG capture on the right; two boards, four sensors each, route and power actions. The original RAW is retained. Capture status and saved paths appear below the controls. |
-| EXP | **Overview**: rails, heaters, IR, burn wire, MCU reset. **Pump U11** (single pump): set/read type, detect, init, frequency, voltage, enable. **Pump U15** (four-channel): detect, init, channel, shared frequency, per-channel voltage, enable. **Motors**: MOTOR rail, DRV8910, per-motor mode, max speed, PWM, optical MIN/MAX mapping and polarity; separate MANUAL and OPERATION command panels. **IR LEDs**: output status and limits, select channel, stage duty and PWM limits, queue configuration, read status, on/off. **Burn wire**: arm/fire state and last result, select wire, stage PWM duty, burn time and maximum total rail current, read status, arm, fire, abort. **Crystallization**: PC status and log location, valve/flow/route mapping, profile fields, Test/Replace/Circulation/ground operations, and manual V1–V4/U11 controls. **Heaters**: manual limits/duty, PID profile configuration, auto start/stop/resume and profile status. **IR Camera**: configure either EXP MLX9064x camera, enable its I2C buffer, detect/init/capture, inspect the PSRAM object ID, and measure maximum temperature in a selected ROI. |
+| EXP | **Overview**: rails, heaters, IR, burn wire, MCU reset. **Pump U11** (single pump): set/read type, detect, init, frequency, voltage, enable. **Pump U15** (four-channel): detect, init, channel, shared frequency, per-channel voltage, enable. **Motors**: MOTOR rail, DRV8910, per-motor mode, max speed, PWM, optical MIN/MAX mapping and polarity; separate MANUAL and OPERATION command panels. **IR LEDs**: output status and limits, select channel, stage duty and PWM limits, queue configuration, read status, on/off. **Burn wire**: runtime and both wire status cards, separate controls per wire, Set config, Read status, and a timed Burn request confirmation. **Crystallization**: PC status and log location, valve/flow/route mapping, profile fields, Test/Replace/Circulation/ground operations, and manual V1–V4/U11 controls. **Heaters**: manual limits/duty, PID profile configuration, auto start/stop/resume and profile status. **IR Camera**: configure either EXP MLX9064x camera, enable its I2C buffer, detect/init/capture, inspect the PSRAM object ID, automatically display the full-frame maximum and its coordinates after capture, and measure maximum or average temperature around a selected center. |
 | PDU | Mode, flags, VOUT/+12/+5_TRANS/+5 rails, faults, events; VOUT/TRANS enable, setpoint, mode, fault clear, temperature limit, heartbeat LED, bootloader |
 | LOG | Every command, refusal and fault, newest last |
 
@@ -169,7 +169,7 @@ file. The `log_pc` UART trace is separate from saved PCLG data.
 `[` `]` / `Tab` / `1-6` switch tab · `,` `.` switch page · `<` `>` switch control panel · `k/j` select within that panel · `Enter`/`Space` edit, toggle or run ·
 `u` update housekeeping now (live sources) · `f` inject a fault on the current subsystem
 (OBC: NTC1 over-temp, EXP: CAN link loss, PDU: TRANS eFuse fault) · `p` pause the simulation (SIM only) · `q` quit.
-Controls marked `[ ! ]` (reboot, burn fire, resets, bootloader) ask for `Y` first.
+Controls marked `[ ! ]` (reboot, resets, bootloader) ask for `Y` first. Burn request uses its own timed CANCEL/FIRE dialog.
 
 Step-by-step procedures (simulation, rig, running on the board, cross-build with `tools/build-board.sh`) are in the MkDocs site: `mkdocs/docs/operation.md` (`cd mkdocs && mkdocs serve`).
 
@@ -292,3 +292,31 @@ Duty and Max duty span 0–100%; maximum defaults to 100%. On time spans 0–500
 zero stays on until OFF. Changes to On time apply on the next ON. Settings are RAM
 only. The firmware must support `ir_cfg_set <ch> duty_pct <value>` and report
 `set_duty_pct` in `ir_status`.
+
+### IR camera point measurements
+
+The status cards show **Max temperature** and **Max position** for the latest
+completed capture, updated by the automatic capture-status follow-up even with
+background polling disabled. These fields require EXP firmware with
+`CAMERA_PEAK` support; older firmware leaves them unavailable.
+
+**Point measurement** uses **Center X** (0–31), **Center Y** (0–23), and **Delta**
+(0–31 pixels). The square includes both endpoints and is clipped to the image
+edges: center (10,10), delta 2 measures (8,8) through (12,12); center (0,0),
+delta 2 measures (0,0) through (2,2). Delta 0 measures a single pixel.
+**Measure max** and **Measure average** report **Point max** and **Point average**
+on the status card. Changing the region or capturing a new frame clears these
+point results. Neither measurement takes a new capture; capture again for a new
+sample. Average measurement requires the new EXP firmware's optional `mean` mode.
+
+### Burn request confirmation
+
+On **Burn wire**, each wire has **Set config**, **Read status**, and **Burn request [RUN]**.
+Burn request opens a five-second dialog with **CANCEL** selected by default and
+sends the internal arm request for that wire. Use arrows or Tab to select CANCEL
+or FIRE, then Enter; Esc cancels. FIRE requires a matching, unexpired arm
+confirmation. Waiting for arm confirmation does not restart the dialog timer.
+The countdown uses monotonic wall time, including while simulation is paused.
+Timeout and cancellation close the dialog and send the internal abort/disarm
+command. Neither can fire. Navigation cannot change wire or page while the
+dialog is open. The Overview Burn request shortcut uses the same dialog.

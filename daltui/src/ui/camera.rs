@@ -20,11 +20,7 @@ fn draw_side(
     status: Vec<Line<'static>>,
 ) {
     let selected = st.sel[Sub::Obc.idx()][1];
-    let panel_color = if range.contains(&selected) {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
+    let panel_color = control_color(range.contains(&selected));
     let block = Block::bordered()
         .border_style(Style::default().fg(panel_color))
         .title(Span::styled(
@@ -45,10 +41,7 @@ fn draw_side(
     ])
     .split(inner);
     let ctrls = Sub::Obc.controls(1);
-    let focus = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
+    let focus = control_focus_style();
     let mut controls = Vec::new();
     for i in range.clone() {
         controls.push(super::controls::row(
@@ -61,7 +54,7 @@ fn draw_side(
     }
     f.render_widget(Paragraph::new(controls), parts[0]);
     f.render_widget(
-        Paragraph::new(status)
+        Paragraph::new(status_lines(status))
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::TOP).border_style(dim())),
         parts[1],
@@ -169,7 +162,7 @@ fn mipi_status(st: &State) -> Vec<Line<'static>> {
             let style = if o.mipi_route == Some((i, sn)) {
                 Style::default().fg(Color::Black).bg(Color::Green)
             } else if sensor == sn {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
+                Style::default().fg(Color::Black).bg(Color::Green)
             } else {
                 dim()
             };

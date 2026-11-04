@@ -115,19 +115,62 @@ fn draw_filtered(
     include: impl Fn(&Control) -> bool,
     summary: bool,
 ) {
-    let color = sub_color(sub);
+    draw_filtered_channel(f, st, sub, area, title, include, summary, None);
+}
+
+pub fn draw_exp_camera(f: &mut Frame, st: &State, area: Rect, channel: usize) {
+    draw_filtered_channel(
+        f,
+        st,
+        Sub::Exp,
+        area,
+        &format!("EXP IR {channel} CONTROL"),
+        |c| c.id != "exp.cam_sel",
+        false,
+        Some(channel),
+    );
+}
+
+pub fn draw_burn(f: &mut Frame, st: &State, area: Rect, wire: usize) {
+    draw_filtered_channel(
+        f,
+        st,
+        Sub::Exp,
+        area,
+        &format!("BURN {wire} CONTROL"),
+        |c| c.id != "exp.burn_sel",
+        false,
+        Some(wire),
+    );
+}
+
+fn draw_filtered_channel(
+    f: &mut Frame,
+    st: &State,
+    sub: Sub,
+    area: Rect,
+    title: &str,
+    include: impl Fn(&Control) -> bool,
+    summary: bool,
+    channel: Option<usize>,
+) {
     let page = st.page[sub.idx()];
     let ctrls = sub.controls(page);
-    let sel = st.sel[sub.idx()][page];
-    let active_color = if include(&ctrls[sel]) {
-        color
+    let sel = if channel.is_some() {
+        st.sel[sub.idx()][page].max(1)
     } else {
-        Color::DarkGray
+        st.sel[sub.idx()][page]
     };
-    let focus = Style::default()
-        .fg(Color::Black)
-        .bg(color)
-        .add_modifier(Modifier::BOLD);
+    let active = include(&ctrls[sel])
+        && channel.is_none_or(|i| {
+            i == if page == 5 {
+                st.sim.exp.burn_sel
+            } else {
+                st.sim.exp.cam_sel
+            }
+        });
+    let active_color = control_color(active);
+    let focus = control_focus_style();
     let block = Block::bordered()
         .border_style(Style::default().fg(active_color))
         .title(Span::styled(
@@ -218,10 +261,17 @@ fn draw_filtered(
                 )));
             }
         }
-        if i == sel {
+        if i == sel && active {
             sel_line = Some(lines.len());
         }
-        lines.push(row(st, c, i == sel, w, focus));
+        lines.push(row_value(
+            st,
+            c,
+            i == sel && active,
+            w,
+            focus,
+            channel_value(st, c.id, channel),
+        ));
     }
 
     let h = parts[0].height as usize;
@@ -233,7 +283,7 @@ fn draw_filtered(
     let shown: Vec<Line> = lines.into_iter().skip(off).take(h).collect();
     f.render_widget(Paragraph::new(shown), parts[0]);
 
-    let hint = if include(&ctrls[sel]) {
+    let hint = if active {
         let reason = if st.sim.live.mode != crate::link::Mode::Sim {
             crate::live::unwired_in(st.sim.live.mode, ctrls[sel].id)
         } else {
@@ -262,10 +312,46 @@ pub(super) fn row(
     w: usize,
     focus: Style,
 ) -> Line<'static> {
+    row_value(st, c, selected, w, focus, st.sim.value(c.id))
+}
+
+fn channel_value(st: &State, id: &str, channel: Option<usize>) -> Val {
+    let Some(i) = channel else {
+        return st.sim.value(id);
+    };
+    let burn = st.sim.exp.burn_setup[i];
+    match id {
+        "exp.burn_duty" => return Val::Num(burn.duty),
+        "exp.burn_time" => return Val::Num(burn.burn_time_ms),
+        "exp.burn_max_total_current" => return Val::Num(burn.max_total_current_ma),
+        _ => {}
+    }
+    let c = &st.sim.exp.camera[i];
+    match id {
+        "exp.cam_model" => Val::Idx(c.model),
+        "exp.cam_addr" => Val::Num(c.address),
+        "exp.cam_format" => Val::Idx(c.format),
+        "exp.cam_hz" => Val::Idx(c.hz),
+        "exp.cam_emiss" => Val::Num(c.emissivity),
+        "exp.cam_x" => Val::Num(c.x),
+        "exp.cam_y" => Val::Num(c.y),
+        "exp.cam_delta" => Val::Num(c.delta),
+        _ => st.sim.value(id),
+    }
+}
+
+fn row_value(
+    st: &State,
+    c: &Control,
+    selected: bool,
+    w: usize,
+    focus: Style,
+    value: Val,
+) -> Line<'static> {
     let na = st.sim.live.mode != crate::link::Mode::Sim
         && crate::live::unwired_in(st.sim.live.mode, c.id).is_some();
     let inactive = crate::live::motor_group_reason(&st.sim, c.group).is_some();
-    let val: Vec<Span<'static>> = match (&c.kind, st.sim.value(c.id)) {
+    let val: Vec<Span<'static>> = match (&c.kind, value) {
         _ if na => vec![txt("[ n/a ]", Color::DarkGray)],
         _ if inactive => vec![txt("[ mode ]", Color::DarkGray)],
         _ if c.id == "exp.pc_name" && st.sim.exp.pc_target != 0 => {
@@ -275,7 +361,7 @@ pub(super) fn row(
             vec![if b {
                 txt("[ ON  ]", Color::Green)
             } else {
-                txt("[ OFF ]", Color::DarkGray)
+                txt("[ OFF ]", Color::Green)
             }]
         }
         (Kind::Step { .. }, Val::Num(v)) if matches!(c.id, "exp.pc_minflow" | "exp.pc_volume") => {
@@ -286,7 +372,7 @@ pub(super) fn row(
             };
             vec![txt(
                 format!("{}.{:03} {unit} [ EDIT ]", v / 1000, v % 1000),
-                Color::Cyan,
+                Color::Green,
             )]
         }
         (Kind::Step { .. }, Val::Num(v))
@@ -294,7 +380,7 @@ pub(super) fn row(
         {
             vec![txt(
                 format!("{v}cC={:.2}°C [edit]", v as f32 / 100.0),
-                Color::Cyan,
+                Color::Green,
             )]
         }
         (Kind::Action, _) if c.id.starts_with("exp.ht_toggle") => {
@@ -324,18 +410,18 @@ pub(super) fn row(
             vec![txt(label, color)]
         }
         (Kind::Step { unit, .. }, Val::Num(v)) => {
-            vec![txt(format!("{v} {unit} [ EDIT ]"), Color::Cyan)]
+            vec![txt(format!("{v} {unit} [ EDIT ]"), Color::Green)]
         }
         (Kind::Choice(opts), Val::Idx(i)) => vec![txt(
             format!("{} [ SELECT ]", opts[i.min(opts.len() - 1)]),
-            Color::Cyan,
+            Color::Green,
         )],
         (Kind::Action, _) if c.id == "exp.pc_name" => vec![txt(
             format!("{} [ EDIT ]", st.sim.exp.pc_name_draft),
-            Color::Cyan,
+            Color::Green,
         )],
-        (Kind::Action, _) if c.id == "obc.rtc_set" => vec![txt("[ EDIT ]", Color::Cyan)],
-        (Kind::Action, _) => vec![txt("[ RUN ]", Color::Cyan)],
+        (Kind::Action, _) if c.id == "obc.rtc_set" => vec![txt("[ EDIT ]", Color::Green)],
+        (Kind::Action, _) => vec![txt("[ RUN ]", Color::Green)],
         (Kind::Danger, _) => vec![txt("[ ! ]", Color::Red)],
         (_, Val::None) if c.id.starts_with("exp.pc_") => vec![txt("[ n/a ]", Color::DarkGray)],
         _ => vec![],
@@ -378,7 +464,7 @@ pub(super) fn row(
     spans.extend(val);
     if selected {
         for s in spans.iter_mut() {
-            s.style = focus;
+            s.style = s.style.patch(focus).fg(s.style.fg.unwrap_or(Color::Green));
         }
     }
     Line::from(spans)
