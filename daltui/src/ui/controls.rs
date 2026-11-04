@@ -16,6 +16,18 @@ pub fn draw(f: &mut Frame, st: &State, sub: Sub, area: Rect) {
     );
 }
 
+pub fn draw_ir(f: &mut Frame, st: &State, area: Rect, channel: usize) {
+    draw_filtered(
+        f,
+        st,
+        Sub::Exp,
+        area,
+        &format!("IR {channel} CONTROL"),
+        |c| crate::controls::ir_field(c.id).is_some_and(|(i, _)| i == channel),
+        false,
+    );
+}
+
 fn motor_mapping(c: &Control) -> bool {
     matches!(c.group, "Limit mapping" | "Limit polarity")
 }
@@ -129,7 +141,13 @@ fn draw_filtered(
     if inner.height < 4 {
         return;
     }
-    let hint_h = if title == "PC SETTINGS" { 2 } else { 4 };
+    let hint_h = if title.starts_with("IR ") {
+        1
+    } else if title == "PC SETTINGS" {
+        2
+    } else {
+        4
+    };
     let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(hint_h)]).split(inner);
     let w = parts[0].width as usize;
 
@@ -170,7 +188,7 @@ fn draw_filtered(
         if !include(c) {
             continue;
         }
-        if c.group != group {
+        if c.group != group && !title.starts_with("IR ") {
             group = c.group;
             let mode_panel = matches!(group, "MANUAL commands" | "OPERATION commands");
             let active = crate::live::motor_group_reason(&st.sim, group).is_none();

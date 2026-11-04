@@ -279,6 +279,7 @@ impl Sim {
         e.ir = [false; 2];
         e.ir_actual_duty = [0; 2];
         e.ir_status_seen = [false; 2];
+        e.ir_applied = [None; 2];
         for c in &mut e.camera {
             c.confirmed = false;
             c.buffer_enabled = None;
@@ -342,6 +343,30 @@ impl Sim {
         self.live.gui_state_age += dt;
         self.obc.snapshot_age += dt;
 
+        // Read back explicitly requested IR field changes, including control-only mode.
+        for i in 0..2 {
+            if self.exp.ir_set_pending[i].is_some()
+                && self.exp.ir_config_pending[i].is_some_and(|t| self.t - t >= 10.0)
+            {
+                self.exp.ir_set_pending[i] = None;
+                self.exp.ir_config_pending[i] = None;
+                self.log(
+                    Sub::Exp,
+                    Level::Warn,
+                    format!("IR {i} setting not confirmed; Read status for actual values"),
+                );
+            }
+        }
+        if self.exp.ir_set_pending.iter().any(Option::is_some)
+            && self.t >= self.live.ir_verify_at
+            && self.live.pending == 0
+        {
+            self.live.send(
+                proto::exp_run("ir_status"),
+                Why::Action("exp.ir0.read".into()),
+            );
+            self.live.ir_verify_at = self.t + 1.0;
+        }
         if self.live.control_only {
             return;
         }
@@ -558,6 +583,20 @@ impl Sim {
                 if id == "exp.pc_profile_apply" {
                     self.exp.pc_apply_pending = cmds.len();
                 }
+                if let Some((i, field)) = crate::controls::ir_field(id) {
+                    let c = self.exp.ir_setup[i];
+                    self.exp.ir_set_pending[i] = match field {
+                        "set_max" => Some(("max_duty_pct", c.max_duty)),
+                        "set_duty" => Some(("set_duty_pct", c.duty)),
+                        "set_pwm" => Some(("pwm_hz", c.pwm_hz)),
+                        "set_time" => Some(("on_ms", c.on_ms)),
+                        _ => self.exp.ir_set_pending[i],
+                    };
+                    if field.starts_with("set_") {
+                        self.exp.ir_config_pending[i] = Some(self.t);
+                        self.live.ir_verify_at = self.t + 1.0;
+                    }
+                }
                 if id == "exp.ir_apply" {
                     let i = self.exp.ir_sel;
                     self.exp.ir_config_pending[i] = Some(self.t);
@@ -680,6 +719,9 @@ pub fn unwired_in(mode: Mode, id: &str) -> Option<&'static str> {
 
 /// Selectors and staged values only edit the draft; the matching Set action sends them.
 fn is_local(id: &str) -> bool {
+    if let Some((_, field)) = crate::controls::ir_field(id) {
+        return matches!(field, "max" | "duty" | "pwm" | "time");
+    }
     if crate::sim::pc_field_index(id).is_some() {
         return true;
     }
@@ -868,6 +910,33 @@ fn sync_pc_field(exp: &mut crate::sim::Exp, target: usize, index: usize, value: 
 
 /// Control id + action -> flight commands. `Err` explains why nothing is sent.
 pub fn plan(s: &mut Sim, id: &str, act: &Act) -> Result<Vec<Cmd>, String> {
+    if let Some((i, field)) = crate::controls::ir_field(id) {
+        let c = s.exp.ir_setup[i];
+        let command = match field {
+            "set_max" if (0..=100).contains(&c.max_duty) => {
+                format!("ir_cfg_set {i} max_duty_pct {}", c.max_duty)
+            }
+            "set_duty" if (0..=100).contains(&c.duty) => {
+                format!("ir_cfg_set {i} duty_pct {}", c.duty)
+            }
+            "set_pwm" if (100..=100000).contains(&c.pwm_hz) => {
+                format!("ir_cfg_set {i} pwm_hz {}", c.pwm_hz)
+            }
+            "set_time" if (0..=5000).contains(&c.on_ms) => {
+                format!("ir_cfg_set {i} on_ms {}", c.on_ms)
+            }
+            "on" => {
+                let c =
+                    s.exp.ir_applied[i].ok_or("Read status first to obtain the applied duty")?;
+                format!("ir_set {i} {}", c.duty)
+            }
+            "off" => format!("ir_off {i}"),
+            "read" => return Ok(vec![proto::exp_run("ir_status")]),
+            _ => return Err("IR field is local or outside its allowed range".into()),
+        };
+        return Ok(vec![proto::exp_run(&command), proto::exp_run("ir_status")]);
+    }
+
     if let Some(why) = unwired_in(s.live.mode, id) {
         return Err(why.into());
     }
@@ -1375,7 +1444,7 @@ pub fn plan(s: &mut Sim, id: &str, act: &Act) -> Result<Vec<Cmd>, String> {
         "exp.ir0" | "exp.ir1" => {
             if on {
                 let duty = e.ir_setup[idx(id)].duty;
-                if !(1..=25).contains(&duty) {
+                if !(0..=100).contains(&duty) {
                     return Err("set IR duty on the IR LEDs page first".into());
                 }
                 exp(format!("ir_set {} {}", idx(id), duty))
@@ -1385,23 +1454,22 @@ pub fn plan(s: &mut Sim, id: &str, act: &Act) -> Result<Vec<Cmd>, String> {
         }
         "exp.ir_apply" => {
             let c = e.ir_setup[e.ir_sel];
-            if c.max_duty < 1
-                || c.max_duty > 25
-                || c.max_on_ms < 1
-                || c.max_on_ms > 100
+            if c.max_duty < 0
+                || c.max_duty > 100
+                || c.on_ms < 0
+                || c.on_ms > 5000
                 || c.pwm_hz < 100
                 || c.pwm_hz > 100000
             {
-                return Err("set max duty 1..25%, max-at-limit time 1..100 ms, and PWM 100..100000 Hz before Queue limits".into());
+                return Err("set max duty 0..100%, on time 0..5000 ms (0 = continuous), and PWM 100..100000 Hz before Set config".into());
             }
-            Ok([
-                format!("ir_cfg_set {} max_duty_pct {}", e.ir_sel, c.max_duty),
-                format!("ir_cfg_set {} max_on_ms {}", e.ir_sel, c.max_on_ms),
-                format!("ir_cfg_set {} pwm_hz {}", e.ir_sel, c.pwm_hz),
-            ]
-            .into_iter()
-            .map(|line| proto::exp_run(&line))
-            .collect())
+            if !(0..=c.max_duty).contains(&c.duty) {
+                return Err("IR duty must be between 0 and Max duty".into());
+            }
+            exp(format!(
+                "ir_config {} {} {} {} {}",
+                e.ir_sel, c.max_duty, c.on_ms, c.pwm_hz, c.duty
+            ))
         }
         "exp.ir_start" => exp(format!("ir_set {} {}", e.ir_sel, e.ir_setup[e.ir_sel].duty)),
         "exp.ir_stop" => exp(format!("ir_off {}", e.ir_sel)),
@@ -1964,13 +2032,19 @@ fn apply_exp_config_status(s: &mut Sim, command: &str, payload: &[u8]) {
                 continue;
             };
             let i = channel as usize;
+            if let Some((field, wanted)) = s.exp.ir_set_pending[i] {
+                if status_value(line, field) == Some(wanted) {
+                    s.exp.ir_set_pending[i] = None;
+                    s.exp.ir_config_pending[i] = None;
+                }
+            }
             let max_duty = status_value(line, "max_duty_pct");
-            let max_on = status_value(line, "max_on_ms");
+            let max_on = status_value(line, "on_ms");
             let pwm = status_value(line, "pwm_hz");
             if s.exp.ir_config_pending[i].is_some() {
                 let wanted = s.exp.ir_setup[i];
                 if max_duty == Some(wanted.max_duty)
-                    && max_on == Some(wanted.max_on_ms)
+                    && max_on == Some(wanted.on_ms)
                     && pwm == Some(wanted.pwm_hz)
                 {
                     s.exp.ir_config_pending[i] = None;
@@ -1981,23 +2055,21 @@ fn apply_exp_config_status(s: &mut Sim, command: &str, payload: &[u8]) {
                         format!("IR {i} limits confirmed by MCU"),
                     );
                 }
-            } else {
-                if let Some(v) = max_duty {
-                    s.exp.ir_setup[i].max_duty = v;
+            }
+            if let (Some(max_duty), Some(on_ms), Some(pwm_hz), Some(duty)) =
+                (max_duty, max_on, pwm, status_value(line, "set_duty_pct"))
+            {
+                s.exp.ir_applied[i] = Some(crate::sim::IrSetup {
+                    max_duty,
+                    on_ms,
+                    pwm_hz,
+                    duty,
+                });
+                if s.exp.ir_config_pending[i].is_none() {
+                    s.exp.ir_configured[i] = true;
                 }
-                if let Some(v) = max_on {
-                    s.exp.ir_setup[i].max_on_ms = v;
-                }
-                if let Some(v) = pwm {
-                    s.exp.ir_setup[i].pwm_hz = v;
-                }
-                s.exp.ir_configured[i] =
-                    s.exp.ir_setup[i].max_duty > 0 && s.exp.ir_setup[i].max_on_ms > 0;
             }
             if let Some(v) = status_value(line, "duty_pct") {
-                if v > 0 {
-                    s.exp.ir_setup[i].duty = v;
-                }
                 s.exp.ir[i] = v > 0;
                 s.exp.ir_actual_duty[i] = v;
             }
@@ -2972,18 +3044,42 @@ mod exp_config_command_tests {
     use super::*;
 
     #[test]
+    fn ir_field_set_targets_one_channel_and_one_field() {
+        let mut sim = Sim::new();
+        sim.exp.ir_setup[1].duty = 37;
+        sim.exp.ir_setup[1].pwm_hz = 12000;
+        assert!(is_local("exp.ir1.duty"));
+        assert_eq!(
+            plan(&mut sim, "exp.ir1.set_duty", &Act::Run).unwrap()[0].text,
+            "exp_run ir_cfg_set 1 duty_pct 37"
+        );
+        assert_eq!(
+            plan(&mut sim, "exp.ir1.set_pwm", &Act::Run).unwrap()[0].text,
+            "exp_run ir_cfg_set 1 pwm_hz 12000"
+        );
+        sim.exp.ir_applied[1] = Some(crate::sim::IrSetup {
+            duty: 20,
+            max_duty: 100,
+            pwm_hz: 100000,
+            on_ms: 0,
+        });
+        assert_eq!(
+            plan(&mut sim, "exp.ir1.on", &Act::Run).unwrap()[0].text,
+            "exp_run ir_set 1 20"
+        );
+    }
+
+    #[test]
     fn ir_and_burn_controls_send_current_firmware_commands() {
         let mut sim = Sim::new();
         sim.exp.ir_setup[0].max_duty = 20;
-        sim.exp.ir_setup[0].max_on_ms = 50;
+        sim.exp.ir_setup[0].on_ms = 50;
         let ir = plan(&mut sim, "exp.ir_apply", &Act::Run).unwrap();
-        assert_eq!(ir.len(), 3);
-        assert_eq!(ir[0].text, "exp_run ir_cfg_set 0 max_duty_pct 20");
-        assert_eq!(ir[1].text, "exp_run ir_cfg_set 0 max_on_ms 50");
-        assert_eq!(ir[2].text, "exp_run ir_cfg_set 0 pwm_hz 100000");
-        // A low configured ceiling can be queued before changing the staged output duty.
+        assert_eq!(ir.len(), 1);
+        assert_eq!(ir[0].text, "exp_run ir_config 0 20 50 100000 10");
         sim.exp.ir_setup[0].max_duty = 5;
-        assert_eq!(plan(&mut sim, "exp.ir_apply", &Act::Run).unwrap().len(), 3);
+        assert!(plan(&mut sim, "exp.ir_apply", &Act::Run).is_err());
+        sim.exp.ir_setup[0].max_duty = 100;
         assert_eq!(
             plan(&mut sim, "exp.ir0", &Act::Bool(true)).unwrap()[0].text,
             "exp_run ir_set 0 10"
@@ -3212,7 +3308,8 @@ mod exp_config_command_tests {
     #[test]
     fn ir_status_updates_output_and_configuration_status() {
         let mut sim = Sim::new();
-        let text = "IR0 active=1 duty_pct=10 remaining_ms=0 pwm_hz=100000 max_duty_pct=20 max_on_ms=50\r\n";
+        let text =
+            "IR0 active=1 duty_pct=10 remaining_ms=0 pwm_hz=100000 max_duty_pct=20 on_ms=50 set_duty_pct=10\r\n";
         let mut payload = vec![0];
         payload.extend_from_slice(&(text.len() as u16).to_le_bytes());
         payload.extend_from_slice(text.as_bytes());
@@ -3227,7 +3324,7 @@ mod exp_config_command_tests {
     fn ir_status_keeps_staged_limits_until_mcu_confirms_them() {
         let mut sim = Sim::new();
         sim.exp.ir_setup[0].max_duty = 20;
-        sim.exp.ir_setup[0].max_on_ms = 50;
+        sim.exp.ir_setup[0].on_ms = 50;
         sim.exp.ir_setup[0].pwm_hz = 12345;
         sim.exp.ir_config_pending[0] = Some(0.0);
         let payload = |text: &str| {
@@ -3236,13 +3333,16 @@ mod exp_config_command_tests {
             p.extend_from_slice(text.as_bytes());
             p
         };
-        let old = payload("IR0 active=0 duty_pct=0 pwm_hz=100000 max_duty_pct=0 max_on_ms=0\r\n");
+        let old = payload(
+            "IR0 active=0 duty_pct=0 pwm_hz=100000 max_duty_pct=0 on_ms=0 set_duty_pct=0\r\n",
+        );
         apply_exp_config_status(&mut sim, "exp_run ir_status", &old);
         assert_eq!(sim.exp.ir_setup[0].pwm_hz, 12345);
         assert!(!sim.exp.ir_configured[0]);
         assert!(sim.exp.ir_config_pending[0].is_some());
-        let applied =
-            payload("IR0 active=0 duty_pct=0 pwm_hz=12345 max_duty_pct=20 max_on_ms=50\r\n");
+        let applied = payload(
+            "IR0 active=0 duty_pct=0 pwm_hz=12345 max_duty_pct=20 on_ms=50 set_duty_pct=10\r\n",
+        );
         apply_exp_config_status(&mut sim, "exp_run ir_status", &applied);
         assert!(sim.exp.ir_configured[0]);
         assert!(sim.exp.ir_config_pending[0].is_none());

@@ -145,7 +145,7 @@ pub struct Rail {
 pub struct IrSetup {
     pub duty: i32,
     pub max_duty: i32,
-    pub max_on_ms: i32,
+    pub on_ms: i32,
     pub pwm_hz: i32,
 }
 
@@ -314,9 +314,12 @@ pub struct Exp {
     pub bubble: [bool; 2],
     pub ir: [bool; 2],
     pub ir_actual_duty: [i32; 2],
+    pub ir_off_at: [Option<f64>; 2],
     pub ir_status_seen: [bool; 2],
     pub ir_sel: usize,
     pub ir_setup: [IrSetup; 2],
+    pub ir_applied: [Option<IrSetup>; 2],
+    pub ir_set_pending: [Option<(&'static str, i32)>; 2],
     pub ir_configured: [bool; 2],
     /// Time at which IR limits were queued; cleared once status confirms them.
     pub ir_config_pending: [Option<f64>; 2],
@@ -643,12 +646,20 @@ impl Sim {
             bubble: [false; 2],
             ir: [false; 2],
             ir_actual_duty: [0; 2],
+            ir_off_at: [None; 2],
             ir_status_seen: [true; 2],
             ir_sel: 0,
+            ir_set_pending: [None; 2],
+            ir_applied: [Some(IrSetup {
+                duty: 0,
+                max_duty: 100,
+                on_ms: 0,
+                pwm_hz: 100000,
+            }); 2],
             ir_setup: [IrSetup {
                 duty: 10,
-                max_duty: 0,
-                max_on_ms: 0,
+                max_duty: 100,
+                on_ms: 0,
                 pwm_hz: 100000,
             }; 2],
             ir_configured: [false; 2],
@@ -904,6 +915,13 @@ impl Sim {
     }
 
     fn tick_exp(&mut self, dt: f64) {
+        for i in 0..2 {
+            if self.exp.ir_off_at[i].is_some_and(|deadline| self.t >= deadline) {
+                self.exp.ir[i] = false;
+                self.exp.ir_actual_duty[i] = 0;
+                self.exp.ir_off_at[i] = None;
+            }
+        }
         let t = self.t;
         let link_lost = self.inject[Sub::Exp.idx()];
         let mut logs: Vec<(Level, String)> = Vec::new();
@@ -1206,6 +1224,16 @@ impl Sim {
     }
 
     pub fn value(&self, id: &str) -> Val {
+        if let Some((i, field)) = crate::controls::ir_field(id) {
+            let c = self.exp.ir_setup[i];
+            return match field {
+                "max" => Val::Num(c.max_duty),
+                "duty" => Val::Num(c.duty),
+                "pwm" => Val::Num(c.pwm_hz),
+                "time" => Val::Num(c.on_ms),
+                _ => Val::None,
+            };
+        }
         let (o, e, p) = (&self.obc, &self.exp, &self.pdu);
         if let Some(i) = pc_field_index(id) {
             if !pc_field_allowed(e.pc_target, i) {
@@ -1306,7 +1334,7 @@ impl Sim {
             "exp.ir_sel" => Val::Idx(e.ir_sel),
             "exp.ir_duty" => Val::Num(e.ir_setup[e.ir_sel].duty),
             "exp.ir_max_duty" => Val::Num(e.ir_setup[e.ir_sel].max_duty),
-            "exp.ir_max_on" => Val::Num(e.ir_setup[e.ir_sel].max_on_ms),
+            "exp.ir_max_on" => Val::Num(e.ir_setup[e.ir_sel].on_ms),
             "exp.ir_pwm" => Val::Num(e.ir_setup[e.ir_sel].pwm_hz),
             "exp.cam_sel" => Val::Idx(e.cam_sel),
             "exp.cam_model" => Val::Idx(e.camera[e.cam_sel].model),
@@ -1479,15 +1507,12 @@ impl Sim {
                 let i = idx(id);
                 let cfg = self.exp.ir_setup[i];
                 if on
-                    && (!self.exp.ir_configured[i]
-                        || cfg.max_duty == 0
-                        || cfg.max_on_ms == 0
-                        || cfg.duty > cfg.max_duty)
+                    && (!self.exp.ir_configured[i] || cfg.max_duty == 0 || cfg.duty > cfg.max_duty)
                 {
                     return self.log(
                         Sub::Exp,
                         Level::Warn,
-                        "IR LED refused: configure duty, max duty, max on time and PWM first",
+                        "IR LED refused: configure duty, max duty, on time and PWM first",
                     );
                 }
                 if on && self.exp.ir[1 - i] {
@@ -1497,6 +1522,12 @@ impl Sim {
                         "IR LED refused: other channel active",
                     );
                 }
+                let on = on && cfg.duty > 0;
+                self.exp.ir_off_at[i] = if on && cfg.on_ms > 0 {
+                    Some(self.t + cfg.on_ms as f64 / 1000.0)
+                } else {
+                    None
+                };
                 self.exp.ir[i] = on;
                 self.exp.ir_actual_duty[i] = if on { cfg.duty } else { 0 };
             }
@@ -1534,6 +1565,17 @@ impl Sim {
 
     pub fn set_num(&mut self, id: &str, v: i32) {
         if self.live.mode != Mode::Sim && self.live_action(id, Act::Num(v)) {
+            return;
+        }
+        if let Some((i, field)) = crate::controls::ir_field(id) {
+            let c = &mut self.exp.ir_setup[i];
+            match field {
+                "max" => c.max_duty = v,
+                "duty" => c.duty = v,
+                "pwm" => c.pwm_hz = v,
+                "time" => c.on_ms = v,
+                _ => {}
+            }
             return;
         }
         if let Some(i) = pc_field_index(id) {
@@ -1601,7 +1643,7 @@ impl Sim {
             }
             "exp.ir_duty" => return self.exp.ir_setup[self.exp.ir_sel].duty = v,
             "exp.ir_max_duty" => self.exp.ir_setup[self.exp.ir_sel].max_duty = v,
-            "exp.ir_max_on" => self.exp.ir_setup[self.exp.ir_sel].max_on_ms = v,
+            "exp.ir_max_on" => self.exp.ir_setup[self.exp.ir_sel].on_ms = v,
             "exp.ir_pwm" => self.exp.ir_setup[self.exp.ir_sel].pwm_hz = v,
             "exp.burn_duty" => self.exp.burn_setup[self.exp.burn_sel].duty = v,
             "exp.burn_time" => self.exp.burn_setup[self.exp.burn_sel].burn_time_ms = v,
@@ -1730,6 +1772,51 @@ impl Sim {
 
     pub fn run(&mut self, id: &str) {
         if self.live.mode != Mode::Sim && self.live_action(id, Act::Run) {
+            return;
+        }
+        if let Some((i, field)) = crate::controls::ir_field(id) {
+            let draft = self.exp.ir_setup[i];
+            let mut applied = self.exp.ir_applied[i].unwrap_or(draft);
+            match field {
+                "set_max" => applied.max_duty = draft.max_duty,
+                "set_duty" => applied.duty = draft.duty,
+                "set_pwm" => applied.pwm_hz = draft.pwm_hz,
+                "set_time" => applied.on_ms = draft.on_ms,
+                "off" => {
+                    self.exp.ir[i] = false;
+                    self.exp.ir_actual_duty[i] = 0;
+                    self.exp.ir_off_at[i] = None;
+                    return;
+                }
+                "on" => {
+                    if !self.exp.exp12v
+                        || self.exp.ir[1 - i]
+                        || applied.duty == 0
+                        || applied.duty > applied.max_duty
+                    {
+                        return;
+                    }
+                    self.exp.ir[i] = true;
+                    self.exp.ir_actual_duty[i] = applied.duty;
+                    self.exp.ir_off_at[i] =
+                        (applied.on_ms > 0).then_some(self.t + applied.on_ms as f64 / 1000.0);
+                    return;
+                }
+                "read" => return,
+                _ => return,
+            }
+            if applied.duty > applied.max_duty {
+                self.log(Sub::Exp, Level::Warn, "Applied duty exceeds Max duty");
+                return;
+            }
+            self.exp.ir_applied[i] = Some(applied);
+            if self.exp.ir[i] {
+                self.exp.ir_actual_duty[i] = applied.duty;
+                if applied.duty == 0 {
+                    self.exp.ir[i] = false;
+                    self.exp.ir_off_at[i] = None;
+                }
+            }
             return;
         }
         let sub = sub_of(id);
@@ -2439,14 +2526,28 @@ impl Sim {
             "exp.ir_apply" => {
                 let i = self.exp.ir_sel;
                 let c = self.exp.ir_setup[i];
-                if c.max_duty < 1
-                    || c.max_duty > 25
-                    || c.max_on_ms < 1
-                    || c.max_on_ms > 100
+                if c.max_duty < 0
+                    || c.max_duty > 100
+                    || c.on_ms < 0
+                    || c.on_ms > 5000
                     || !(100..=100000).contains(&c.pwm_hz)
                 {
                     return self.log(Sub::Exp, Level::Warn,
-                        "set max duty 1..25%, max-at-limit time 1..100 ms, and PWM 100..100000 Hz before Queue limits");
+                        "set max duty 0..100%, on time 0..5000 ms (0 = continuous), and PWM 100..100000 Hz before Set config");
+                }
+                if !(0..=c.max_duty).contains(&c.duty) {
+                    return self.log(
+                        Sub::Exp,
+                        Level::Warn,
+                        "IR duty must be between 0 and Max duty",
+                    );
+                }
+                if self.exp.ir[i] {
+                    self.exp.ir_actual_duty[i] = c.duty;
+                    if c.duty == 0 {
+                        self.exp.ir[i] = false;
+                        self.exp.ir_off_at[i] = None;
+                    }
                 }
                 self.exp.ir_configured[i] = true;
                 self.exp.ir_config_pending[i] = None;
@@ -2456,7 +2557,7 @@ impl Sim {
                     Level::Ok,
                     format!(
                         "IR {i} configured: duty {}%, max {}%, on {} ms, PWM {} Hz",
-                        c.duty, c.max_duty, c.max_on_ms, c.pwm_hz
+                        c.duty, c.max_duty, c.on_ms, c.pwm_hz
                     ),
                 );
             }
@@ -2964,6 +3065,74 @@ mod utc_tests {
 #[cfg(test)]
 mod exp_output_tests {
     use super::*;
+
+    #[test]
+    fn ir_drafts_and_partial_sets_are_independent() {
+        let mut sim = Sim::new();
+        sim.set_num("exp.ir1.duty", 30);
+        sim.set_num("exp.ir1.pwm", 12000);
+        assert_eq!(sim.exp.ir_applied[1].unwrap().duty, 0);
+        sim.run("exp.ir1.set_duty");
+        assert_eq!(sim.exp.ir_applied[1].unwrap().duty, 30);
+        assert_eq!(sim.exp.ir_applied[1].unwrap().pwm_hz, 100000);
+        assert_eq!(sim.exp.ir_applied[0].unwrap().duty, 0);
+        assert!(!sim.exp.ir[1]);
+        sim.set_bool("exp.exp12v", true);
+        sim.set_num("exp.ir1.duty", 40);
+        sim.run("exp.ir1.on");
+        assert_eq!(sim.exp.ir_actual_duty[1], 30);
+        sim.run("exp.ir1.set_duty");
+        assert_eq!(sim.exp.ir_actual_duty[1], 40);
+    }
+
+    #[test]
+    fn ir_set_config_updates_live_duty_without_restarting_timer() {
+        let mut sim = Sim::new();
+        assert_eq!(sim.exp.ir_setup[0].max_duty, 100);
+        sim.set_bool("exp.exp12v", true);
+        sim.set_num("exp.ir_max_on", 1000);
+        sim.run("exp.ir_apply");
+        assert!(!sim.exp.ir[0]);
+        sim.run("exp.ir_start");
+        sim.tick(0.5);
+        sim.set_num("exp.ir_duty", 60);
+        sim.set_num("exp.ir_max_on", 2000);
+        sim.run("exp.ir_apply");
+        assert_eq!(sim.exp.ir_actual_duty[0], 60);
+        sim.tick(0.5);
+        assert!(!sim.exp.ir[0]);
+        sim.run("exp.ir_start");
+        sim.tick(1.0);
+        assert!(sim.exp.ir[0]);
+        sim.set_num("exp.ir_duty", 0);
+        sim.run("exp.ir_apply");
+        assert!(!sim.exp.ir[0]);
+    }
+
+    #[test]
+    fn ir_timer_rearms_and_zero_duration_stays_on() {
+        let mut sim = Sim::new();
+        sim.set_bool("exp.exp12v", true);
+        sim.set_num("exp.ir_max_duty", 100);
+        sim.set_num("exp.ir_duty", 100);
+        sim.set_num("exp.ir_max_on", 1000);
+        sim.run("exp.ir_apply");
+        for _ in 0..2 {
+            sim.run("exp.ir_start");
+            assert!(sim.exp.ir[0]);
+            sim.tick(0.5);
+            assert!(sim.exp.ir[0]);
+            sim.tick(0.5);
+            assert!(!sim.exp.ir[0]);
+        }
+        sim.set_num("exp.ir_max_on", 0);
+        sim.run("exp.ir_apply");
+        sim.run("exp.ir_start");
+        sim.tick(10.0);
+        assert!(sim.exp.ir[0]);
+        sim.run("exp.ir_stop");
+        assert!(!sim.exp.ir[0]);
+    }
 
     #[test]
     fn ir_requires_limits_and_exp_12v_before_it_can_turn_on() {

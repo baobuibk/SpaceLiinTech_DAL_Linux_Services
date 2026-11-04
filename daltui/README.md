@@ -278,3 +278,17 @@ a PDU fault latches ERROR mode until cleared, heaters trip at 60 °C.
 - `src/live.rs` control id to command (`plan`), reply to model (`decode`/`apply`), polling
 - `tools/fsw_rig.py` hardware-free sandbox around the host flight software
 - `src/app.rs` state and keys, `src/ui/` drawing
+
+
+IR LEDs uses three columns with IR 0 above IR 1 in each column:
+**Output / EXP** shows the last confirmed applied configuration and live duty,
+**Config draft** shows edits, and **Control** has independent EDIT/Set buttons
+for Max duty, Duty, PWM, and On time. Each Set writes only that field and reads
+back EXP status, including when polling is disabled. Drafts are never overwritten
+by status. If confirmation times out, Output retains the last observed values.
+IR ON uses the applied duty, not an unsubmitted edit; use Read status first in live
+mode. Set Duty while ON changes output without restarting the running timer.
+Duty and Max duty span 0–100%; maximum defaults to 100%. On time spans 0–5000 ms;
+zero stays on until OFF. Changes to On time apply on the next ON. Settings are RAM
+only. The firmware must support `ir_cfg_set <ch> duty_pct <value>` and report
+`set_duty_pct` in `ir_status`.

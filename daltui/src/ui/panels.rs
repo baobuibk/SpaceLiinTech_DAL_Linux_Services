@@ -614,9 +614,13 @@ fn exp_ir(s: &Sim) -> (Vec<Panel>, Vec<Panel>) {
         kv1("Requested", 12, format!("{} %", c.duty), Color::White),
         kv1("Max duty", 12, format!("{} %", c.max_duty), Color::White),
         kv1(
-            "At max duty",
+            "On time",
             12,
-            format!("{} ms", c.max_on_ms),
+            if c.on_ms == 0 {
+                "continuous".into()
+            } else {
+                format!("{} ms", c.on_ms)
+            },
             Color::White,
         ),
         kv1("PWM", 12, format!("{} Hz", c.pwm_hz), Color::White),

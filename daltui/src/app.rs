@@ -23,32 +23,30 @@ mod pwm_editor_tests {
 
     #[test]
     fn enter_edits_frequency_and_rejects_out_of_range_value() {
-        let mut st = State::new();
-        st.tab = Tab::Exp;
-        st.page[Sub::Exp.idx()] = 4;
-        let i = Sub::Exp
-            .controls(4)
-            .iter()
-            .position(|c| c.id == "exp.ir_pwm")
-            .unwrap();
-        st.activate(Sub::Exp, i, 0, false);
-        assert_eq!(st.pwm_edit.as_deref(), Some("100000"));
-        st.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        for c in "12345".chars() {
-            st.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        for id in ["exp.ir0.pwm", "exp.ir1.pwm"] {
+            let mut st = State::new();
+            st.tab = Tab::Exp;
+            st.page[Sub::Exp.idx()] = 4;
+            let i = Sub::Exp
+                .controls(4)
+                .iter()
+                .position(|c| c.id == id)
+                .unwrap();
+            st.activate(Sub::Exp, i, 0, false);
+            for c in "12345".chars() {
+                st.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            st.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(st.num_edit.is_none());
+            assert!(matches!(st.sim.value(id), Val::Num(12345)));
+            st.activate(Sub::Exp, i, 0, false);
+            for c in "99".chars() {
+                st.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            st.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(st.num_edit.is_some());
+            assert!(matches!(st.sim.value(id), Val::Num(12345)));
         }
-        st.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(st.pwm_edit.is_none());
-        assert!(matches!(st.sim.value("exp.ir_pwm"), Val::Num(12345)));
-
-        st.activate(Sub::Exp, i, 0, false);
-        st.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        for c in "99".chars() {
-            st.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-        }
-        st.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(st.pwm_edit.is_some());
-        assert!(matches!(st.sim.value("exp.ir_pwm"), Val::Num(12345)));
     }
 }
 
@@ -882,7 +880,7 @@ impl State {
                 KeyCode::Enter => match buf.parse::<i32>() {
                     Ok(hz) if (100..=100_000).contains(&hz) => {
                         self.pwm_edit = None;
-                        self.sim.set_num("exp.ir_pwm", hz);
+                        self.sim.set_num("exp.ir0.pwm", hz);
                         self.pump_logs();
                     }
                     _ => {
@@ -1113,10 +1111,6 @@ impl State {
             }
             Kind::Step { .. } => {
                 if let Val::Num(v) = self.sim.value(c.id) {
-                    if c.id == "exp.ir_pwm" {
-                        self.pwm_edit = Some(v.to_string());
-                        return;
-                    }
                     self.num_edit = Some((c.id, v.to_string()));
                     self.num_edit_replace = true;
                 }

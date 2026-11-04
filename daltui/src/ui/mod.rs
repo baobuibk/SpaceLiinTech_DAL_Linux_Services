@@ -5,6 +5,7 @@ pub(crate) mod cfg;
 mod controls;
 mod heater;
 mod home;
+mod ir;
 mod log;
 mod panels;
 mod pc;
@@ -431,6 +432,10 @@ fn draw_subsystem(f: &mut Frame, st: &State, sub: Sub, area: Rect) {
     }
     if sub == Sub::Obc && st.page[sub.idx()] == 1 {
         camera::draw(f, st, rows[1]);
+        return;
+    }
+    if sub == Sub::Exp && st.page[sub.idx()] == 4 {
+        ir::draw(f, st, rows[1]);
         return;
     }
     if sub == Sub::Exp && st.page[sub.idx()] == 7 {

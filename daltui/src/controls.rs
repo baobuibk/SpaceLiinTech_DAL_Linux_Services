@@ -673,16 +673,167 @@ pub static EXP_MOTOR: &[Control] = &[
     ),
 ];
 
+pub fn ir_field(id: &str) -> Option<(usize, &str)> {
+    let (channel, field) = id.strip_prefix("exp.ir")?.split_once('.')?;
+    let channel: usize = channel.parse().ok()?;
+    (channel < 2).then_some((channel, field))
+}
+
 pub static EXP_IR: &[Control] = &[
-    c("IR channel", "exp.ir_sel", "Channel", Kind::Choice(&["IR 0", "IR 1"]), "Select the IR LED to configure."),
-    c("Manual output", "exp.ir_duty", "Duty", step(1, 25, 1, "%"), "Requested continuous PWM duty; hard cap 25%."),
-    c("Limits (RAM only)", "exp.ir_max_duty", "Max duty", step(1, 25, 1, "%"), "Must be at least the requested duty; hard cap 25%."),
-    c("Limits (RAM only)", "exp.ir_max_on", "At max duty", step(1, 100, 1, "ms"), "MCU cap 100 ms at configured maximum duty; manual IR below that duty has no timer."),
-    c("Limits (RAM only)", "exp.ir_pwm", "PWM frequency", step(100, 100000, 100, "Hz"), "Press Enter to type 100–100000 Hz; default 100000 Hz."),
-    c("Limits (RAM only)", "exp.ir_apply", "Queue limits", Kind::Action, "Queue three asynchronous ir_cfg_set requests; the TUI checks ir_status until the MCU applies them."),
-    c("Operation", "exp.ir_start", "IR ON", Kind::Action, "EXP 12 V ON, limits configured, other IR channel OFF."),
-    c("Operation", "exp.ir_stop", "IR OFF", Kind::Action, "Immediately stop the selected IR channel."),
-    c("Operation", "exp.ir_status", "Read status", Kind::Action, "Read actual duty and limits from EXP."),
+    c(
+        "IR 0",
+        "exp.ir0.max",
+        "Max duty",
+        step(0, 100, 1, "%"),
+        "Maximum allowed duty.",
+    ),
+    c(
+        "IR 0",
+        "exp.ir0.set_max",
+        "Set Duty Max",
+        Kind::Action,
+        "Apply only Max duty.",
+    ),
+    c(
+        "IR 0",
+        "exp.ir0.duty",
+        "Duty",
+        step(0, 100, 1, "%"),
+        "Stage duty; Set Duty applies it without restarting the timer.",
+    ),
+    c(
+        "IR 0",
+        "exp.ir0.set_duty",
+        "Set Duty",
+        Kind::Action,
+        "Apply only duty. Zero turns off; setting duty while OFF does not turn on.",
+    ),
+    c(
+        "IR 0",
+        "exp.ir0.pwm",
+        "PWM",
+        step(100, 100000, 100, "Hz"),
+        "Stage PWM frequency.",
+    ),
+    c(
+        "IR 0",
+        "exp.ir0.set_pwm",
+        "Set PWM",
+        Kind::Action,
+        "Apply only PWM frequency.",
+    ),
+    c(
+        "IR 0",
+        "exp.ir0.time",
+        "On time",
+        step(0, 5000, 1, "ms"),
+        "Zero means continuous. A new duration applies to the next ON.",
+    ),
+    c(
+        "IR 0",
+        "exp.ir0.set_time",
+        "Set On time",
+        Kind::Action,
+        "Apply only On time.",
+    ),
+    c(
+        "IR 0",
+        "exp.ir0.on",
+        "IR ON",
+        Kind::Action,
+        "Start using the duty applied to EXP.",
+    ),
+    c(
+        "IR 0",
+        "exp.ir0.off",
+        "IR OFF",
+        Kind::Action,
+        "Stop this IR channel.",
+    ),
+    c(
+        "IR 0",
+        "exp.ir0.read",
+        "Read status",
+        Kind::Action,
+        "Read applied configuration and output from EXP.",
+    ),
+    c(
+        "IR 1",
+        "exp.ir1.max",
+        "Max duty",
+        step(0, 100, 1, "%"),
+        "Maximum allowed duty.",
+    ),
+    c(
+        "IR 1",
+        "exp.ir1.set_max",
+        "Set Duty Max",
+        Kind::Action,
+        "Apply only Max duty.",
+    ),
+    c(
+        "IR 1",
+        "exp.ir1.duty",
+        "Duty",
+        step(0, 100, 1, "%"),
+        "Stage duty; Set Duty applies it without restarting the timer.",
+    ),
+    c(
+        "IR 1",
+        "exp.ir1.set_duty",
+        "Set Duty",
+        Kind::Action,
+        "Apply only duty. Zero turns off; setting duty while OFF does not turn on.",
+    ),
+    c(
+        "IR 1",
+        "exp.ir1.pwm",
+        "PWM",
+        step(100, 100000, 100, "Hz"),
+        "Stage PWM frequency.",
+    ),
+    c(
+        "IR 1",
+        "exp.ir1.set_pwm",
+        "Set PWM",
+        Kind::Action,
+        "Apply only PWM frequency.",
+    ),
+    c(
+        "IR 1",
+        "exp.ir1.time",
+        "On time",
+        step(0, 5000, 1, "ms"),
+        "Zero means continuous. A new duration applies to the next ON.",
+    ),
+    c(
+        "IR 1",
+        "exp.ir1.set_time",
+        "Set On time",
+        Kind::Action,
+        "Apply only On time.",
+    ),
+    c(
+        "IR 1",
+        "exp.ir1.on",
+        "IR ON",
+        Kind::Action,
+        "Start using the duty applied to EXP.",
+    ),
+    c(
+        "IR 1",
+        "exp.ir1.off",
+        "IR OFF",
+        Kind::Action,
+        "Stop this IR channel.",
+    ),
+    c(
+        "IR 1",
+        "exp.ir1.read",
+        "Read status",
+        Kind::Action,
+        "Read applied configuration and output from EXP.",
+    ),
 ];
 
 pub static EXP_CAMERA: &[Control] = &[
