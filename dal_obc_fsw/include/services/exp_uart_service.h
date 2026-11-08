@@ -7,6 +7,8 @@
 /* Status 0=success, 1=EXP/serial error, 2=timeout, 3=unconfigured,
  * 4=output too large. Output is NUL-terminated for local consumers. */
 uint8_t exp_uart_command(const char *command, char *output, size_t capacity);
+/* Bounded command transaction for short native sensor requests. */
+uint8_t exp_uart_sensor_command(const char *command, char *output, size_t capacity);
 /* Read an MCU RPARAM table through the UART0 CLI's param_show command. */
 uint8_t exp_uart_param_show(unsigned table, char *output, size_t capacity);
 /* Return a recent background sample for a read-only wire-status command. */

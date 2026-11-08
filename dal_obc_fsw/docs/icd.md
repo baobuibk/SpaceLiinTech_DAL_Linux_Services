@@ -67,7 +67,24 @@ The reply has the same START, LENGTH, PAYLOAD, and CRC positions. On success, by
 | `0x02` | Memory error |
 | `0x03` | Unknown error |
 
-The generic ACK payload is a U32 system uptime in seconds (TM LENGTH = 4; uptime at byte 5; CRC at byte 9). Some commands define another reply layout in the tables below.
+### TM ACK package (PDF revision 1.0)
+
+The original ICD defines this successful acknowledgement on printed page 8 (PDF page 4). It is **11 bytes total**, with a **4-byte payload**. LENGTH counts only the payload, not the header or CRC. Multibyte values are little-endian.
+
+| Field | Data type | Size (B) | Byte offset | Value / meaning |
+| --- | --- | ---: | ---: | --- |
+| START | U8 | 1 | 0 | `0xA5` |
+| ACK/ERR | U8 | 1 | 1 | Copy of TC TYPE |
+| ADDR/ERRCODE | U8 | 1 | 2 | Copy of TC ADDR |
+| LENGTH | U16 LE | 2 | 3 | `4` (`04 00`) |
+| System uptime (sec) | U32 LE | 4 | 5 | System uptime in seconds |
+| CRC-16 | U16 LE | 2 | 9 | CRC-16; see [CRC parameters](#crc-parameters) |
+
+```text
+A5 TYPE ADDR 04 00 UPTIME_0 UPTIME_1 UPTIME_2 UPTIME_3 CRC_LO CRC_HI
+```
+
+`UPTIME_0` is the least-significant byte. ACK reports the command acknowledgement; it does not by itself prove completion of an asynchronous operation. This layout applies where the PDF specifies “TM ACK package”; it is not the layout of every successful TM. Command-specific data replies and current FSW deviations are described separately below.
 
 ### CRC parameters
 
@@ -221,32 +238,60 @@ The PDF gives `rsv_op1` the description “LEV subsystem manual control” and `
 
 | TYPE/ADDR | Name | TC payload | TM payload | Purpose |
 | --- | --- | --- | --- | --- |
-| `03/00` | `dat_lst` | U8 mark filter | Three U32 file counts | Count files by type |
-| `03/01` | `dat_sel` | U8 type, U16 index, U16 chunk size | 41-byte metadata | Select a file |
-| `03/02` | `dat_get` | U32 chunk index | N raw chunk bytes | Download selected chunk |
-| `03/03` | `dat_des` | 0 | ACK | Deselect file |
-| `03/04` | `dat_del` | U8 type, U32 index | Three U32 file counts | Delete file |
-| `03/05` | `dat_mrk` | U8 mark | ACK | Mark selected file |
+| `03/00` | [`dat_lst`](#dat_lst-0x00) | U8 mark filter | Three U32 file counts | Count files by type |
+| `03/01` | [`dat_sel`](#dat_sel-0x01) | U8 type, U16 index, U16 chunk size | 41-byte metadata | Select a file |
+| `03/02` | [`dat_get`](#dat_get-0x02) | U32 chunk index | N raw chunk bytes | Download selected chunk |
+| `03/03` | [`dat_des`](#dat_des-0x03) | 0 | ACK | Deselect file |
+| `03/04` | [`dat_del`](#dat_del-0x04) | U8 type, U32 index | Three U32 file counts | Delete file |
+| `03/05` | [`dat_mrk`](#dat_mrk-0x05) | U8 mark | ACK | Mark selected file |
 
 File types are 0 HK, 1 SCI1, and 2 SCI2. The `dat_lst` filter is `0xFF` for all files, `0x00` for unmarked files, or `0x01`–`0xFE` for a particular mark. The PDF limits chunk size to **32768 bytes**, despite the U16 field's wider range. Chunk indexes are zero-based U32 values.
 
 #### Current three-category storage layout
 
-The current OBC implementation keeps the revision 1.0 frame sizes and command addresses, but assigns the three `dat_lst` counts and `dat_sel` data-type values as follows. This is a flight-software extension of the printed HK/SCI1/SCI2 labels.
+The current OBC groups files by their **storage folder**, not by their filename
+extension. The three counts returned by `dat_lst` are in this order; the same
+numeric type is passed to `dat_sel` and `dat_del`:
 
-| Type | Count / selector | Source folder under `/home/bee/data` | Filename pattern (20-byte maximum) |
+| Type | Current name | Meaning | Legacy ICD label |
 | ---: | --- | --- | --- |
-| `0` | Logs | `logs/hk/` | `HK0_YYYYMMDD.csv` (OBC), `HK1_YYYYMMDD.csv` (EXP) |
-| `0` | Logs | `logs/lwl/` | `LWL_NNNNNNNN.bin` |
-| `0` | Logs | `logs/pc/` | `PC_NNNNNNNN.bin` |
-| `1` | Images | `images/usb/` | `USB0_NNNNNNNN.jpg` through `USB3_NNNNNNNN.jpg` |
-| `1` | Images | `images/mipi/` | `MIPIc.s_H_NNNNNN.raw` and `.png` (current MIPI capture); `.jpg` may be added by another producer; `c=0..1`, `s=0..3`, `R=H` or `L` |
-| `2` | Data | `data/lev/` | `LEV_NNNNNNNN.bin` |
-| `2` | Data | `data/other/` | `OTHER_NNNNNNNN.bin` |
+| `0` | **Logs** | Housekeeping, firmware diagnostic logs, and PC experiment logs | HK |
+| `1` | **Images** | USB, MIPI, and EXP IR camera images, including raw thermal `.bin` frames | SCI1 |
+| `2` | **Data** | LEV payload data and other general data products | SCI2 |
+
+Default storage root on the OBC: **`/home/bee/data`**.
+
+| Type | Folder on OBC | Contents / example filenames |
+| ---: | --- | --- |
+| `0` Logs | `/home/bee/data/logs/hk/` | Housekeeping CSV: `HK0_YYYYMMDD.csv` (OBC), `HK1_YYYYMMDD.csv` (EXP) |
+| `0` Logs | `/home/bee/data/logs/lwl/` | LWL firmware diagnostic logs; collected EXP objects: `EXP_B00000078_O00000001.bin` |
+| `0` Logs | `/home/bee/data/logs/pc/` | PC experiment logs; collected EXP objects: `EXP_Bxxxxxxxx_Oxxxxxxxx.bin` |
+| `1` Images | `/home/bee/data/images/usb/` | USB camera images, e.g. `USB0_NNNNNNNN.jpg` |
+| `1` Images | `/home/bee/data/images/mipi/` | MIPI camera `.raw` frames and converted `.png` images, e.g. `MIPI0.0_H_000001.raw` |
+| `1` Images | `/home/bee/data/images/exp/` | EXP IR camera frames, e.g. `EXP_C1_B00000078_O00000028_E2.bin`; `E1` is int16, `E2` is float32 |
+| `2` Data | `/home/bee/data/data/lev/` | LEV data products, e.g. `LEV_NNNNNNNN.bin` when produced |
+| `2` Data | `/home/bee/data/data/other/` | Other data products, e.g. `OTHER_NNNNNNNN.bin` when produced |
+
+These are the directories scanned by the file-transfer backend. A directory may
+not exist until a producer creates its first file. An EXP thermal `.bin` belongs
+to **Images (type 1)**, while an EXP LWL/PC `.bin` belongs to **Logs (type 0)**.
+`dat_lst` returns counts, not a list of filenames; use `dat_sel` to inspect each
+file's metadata. Indexes start at zero within each type and combine all folders
+of that type, sorted by relative path.
+
+`DAL_DATA_DIR` overrides the file-transfer root; replace `/home/bee/data` above
+with that configured root. The EXP object collector can separately use
+`DAL_EXP_DATA_DIR` (falling back to `DAL_DATA_DIR`, then `/home/bee/data`). Keep
+these roots aligned if collected EXP files must be visible through `dat_lst`.
+
+The disk basename may be longer than the **20-byte filename field in `dat_sel`**;
+that field is truncated for long names. FSW retains the full relative path
+internally and `dat_get` reads the selected file using that path. The 20-byte
+field is not a filesystem filename limit.
 
 The `dat_sel` index is zero-based within its type, sorted by relative folder and filename at `dat_lst` time. Its 20-byte metadata field contains the basename; the OBC retains the folder internally. A 20-byte name has no trailing NUL. `dat_get` uses the selected path. Marks are keyed by relative path so matching basenames in separate folders remain distinct. `dat_del` uses the printed five-byte TC (`U8 type`, `U32 index`).
 
-The current GUI MIPI capture retains a 5120×3840 BG10 `.raw` frame and saves a full-resolution `.png` with the same basename. Both appear in the image index. The PNG is made with `/home/root/tools/bin/raw_png` using `grbg` Bayer order; FSW discards that converter’s low-resolution intermediate. If conversion fails, the RAW remains and capture reports an error. JPEG and low-resolution files enter this index when their producers save them using a supported basename. The legacy EXP data-ready handoff routes `TypeName` prefixes (`LWL`, `PC`, `LEV`) into those folders and other prefixes to `data/other/`. The current EXP MCU instead exposes PSRAM object descriptors through `data_list` and `data_read`; `hk_service` does not yet ingest that interface, so current EXP LWL/PC objects will not appear until that bridge is updated. Existing files in former locations are not automatically migrated.
+The current GUI MIPI capture retains a 5120×3840 BG10 `.raw` frame and saves a full-resolution `.png` with the same basename. Both appear in the image index. The PNG is made with `/home/root/tools/bin/raw_png` using `grbg` Bayer order; FSW discards that converter’s low-resolution intermediate. If conversion fails, the RAW remains and capture reports an error. JPEG and low-resolution files enter this index when their producers save them using a supported basename. The legacy EXP data-ready handoff routes `TypeName` prefixes (`LWL`, `PC`, `LEV`) into those folders and other prefixes to `data/other/`. The current FSW EXP object collector reads pending PSRAM objects announced by table 6 using `data_ready_collect` and `data_read`, verifies CRC32, saves images to `images/exp/` and LWL/PC logs to `logs/lwl/` or `logs/pc/`, then acknowledges completion with `data_ready_done`. Collection is disabled when `DAL_EXP_DATA_ENABLE=0`. Existing files in former locations are not automatically migrated.
 
 #### `dat_sel` response layout
 
@@ -267,7 +312,7 @@ The declared TM payload length is 41 bytes, which matches the offsets through by
 
 #### Transfer sequence
 
-1. Call `dat_lst`, optionally filtering by mark, and choose a file type and index.
+1. Call `dat_lst 0xFF` for all files (or supply a specific mark), and choose a file type and index.
 2. Call `dat_sel` with a chunk size of at most 32768 bytes; record name, size, CRC-32, and chunk count.
 3. Call `dat_get` for chunk indexes 0 through count − 1 and concatenate the returned bytes.
 4. Verify the complete file against the CRC-32 from `dat_sel`. On mismatch, select and transfer again.
@@ -487,7 +532,22 @@ Communication check.
 
 **TM**
 
-TM ACK package
+**TM ACK package — PDF revision 1.0, 11 bytes total**
+
+| Field | Data type | Size (B) | Byte offset | Value / meaning |
+| --- | --- | ---: | ---: | --- |
+| START | U8 | 1 | 0 | `0xA5` |
+| ACK/ERR | U8 | 1 | 1 | `0x00` (TC TYPE) |
+| ADDR/ERRCODE | U8 | 1 | 2 | `0x00` (TC ADDR) |
+| LENGTH | U16 LE | 2 | 3 | `4` (`04 00`) |
+| System uptime (sec) | U32 LE | 4 | 5 | System uptime in seconds |
+| CRC-16 | U16 LE | 2 | 9 | CRC-16; see [CRC parameters](#crc-parameters) |
+
+```text
+A5 00 00 04 00 UPTIME_0 UPTIME_1 UPTIME_2 UPTIME_3 CRC_LO CRC_HI
+```
+
+The current FSW uses this uptime ACK layout on success.
 
 System Conﬁguration (TYPE = 0x01)
 
@@ -1177,7 +1237,22 @@ UVC subsystem manual control
 
 **TM**
 
-TM ACK package
+**TM ACK package — PDF revision 1.0, 11 bytes total**
+
+| Field | Data type | Size (B) | Byte offset | Value / meaning |
+| --- | --- | ---: | ---: | --- |
+| START | U8 | 1 | 0 | `0xA5` |
+| ACK/ERR | U8 | 1 | 1 | `0x01` (TC TYPE) |
+| ADDR/ERRCODE | U8 | 1 | 2 | `0x11` (TC ADDR) |
+| LENGTH | U16 LE | 2 | 3 | `4` (`04 00`) |
+| System uptime (sec) | U32 LE | 4 | 5 | System uptime in seconds |
+| CRC-16 | U16 LE | 2 | 9 | CRC-16; see [CRC parameters](#crc-parameters) |
+
+```text
+A5 01 11 04 00 UPTIME_0 UPTIME_1 UPTIME_2 UPTIME_3 CRC_LO CRC_HI
+```
+
+**Current FSW differs:** `uvc_ctl` returns an 8-byte camera job payload, not uptime. See [current uvc_ctl / uvc_stat layout](#current-uvc_ctl-and-uvc_stat-implementation).
 
 
 #### uvc_stat (0x12)
@@ -1331,7 +1406,22 @@ Thermal subsystem manual control
 
 **TM**
 
-TM ACK package
+**TM ACK package — PDF revision 1.0, 11 bytes total**
+
+| Field | Data type | Size (B) | Byte offset | Value / meaning |
+| --- | --- | ---: | ---: | --- |
+| START | U8 | 1 | 0 | `0xA5` |
+| ACK/ERR | U8 | 1 | 1 | `0x01` (TC TYPE) |
+| ADDR/ERRCODE | U8 | 1 | 2 | `0x14` (TC ADDR) |
+| LENGTH | U16 LE | 2 | 3 | `4` (`04 00`) |
+| System uptime (sec) | U32 LE | 4 | 5 | System uptime in seconds |
+| CRC-16 | U16 LE | 2 | 9 | CRC-16; see [CRC parameters](#crc-parameters) |
+
+```text
+A5 01 14 04 00 UPTIME_0 UPTIME_1 UPTIME_2 UPTIME_3 CRC_LO CRC_HI
+```
+
+The current FSW uses this uptime ACK layout on success.
 
 
 ##### Current thm_ctl implementation
@@ -1591,7 +1681,22 @@ Fluidic subsystem manual control
 
 **TM**
 
-TM ACK package
+**TM ACK package — PDF revision 1.0, 11 bytes total**
+
+| Field | Data type | Size (B) | Byte offset | Value / meaning |
+| --- | --- | ---: | ---: | --- |
+| START | U8 | 1 | 0 | `0xA5` |
+| ACK/ERR | U8 | 1 | 1 | `0x01` (TC TYPE) |
+| ADDR/ERRCODE | U8 | 1 | 2 | `0x17` (TC ADDR) |
+| LENGTH | U16 LE | 2 | 3 | `4` (`04 00`) |
+| System uptime (sec) | U32 LE | 4 | 5 | System uptime in seconds |
+| CRC-16 | U16 LE | 2 | 9 | CRC-16; see [CRC parameters](#crc-parameters) |
+
+```text
+A5 01 17 04 00 UPTIME_0 UPTIME_1 UPTIME_2 UPTIME_3 CRC_LO CRC_HI
+```
+
+**Current FSW differs:** valve control returns an empty payload; pump submission returns a U32 request ID. See [current fld_ctl layout](#fld_ctl-manual-valve-and-pump-control).
 
 
 #### ﬂd_stat (0x18)
@@ -1676,7 +1781,22 @@ RBA subsystem manual control. See the [implemented console and binary layout](#c
 
 **TM**
 
-TM ACK package
+**TM ACK package — PDF revision 1.0, 11 bytes total**
+
+| Field | Data type | Size (B) | Byte offset | Value / meaning |
+| --- | --- | ---: | ---: | --- |
+| START | U8 | 1 | 0 | `0xA5` |
+| ACK/ERR | U8 | 1 | 1 | `0x01` (TC TYPE) |
+| ADDR/ERRCODE | U8 | 1 | 2 | `0x1A` (TC ADDR) |
+| LENGTH | U16 LE | 2 | 3 | `4` (`04 00`) |
+| System uptime (sec) | U32 LE | 4 | 5 | System uptime in seconds |
+| CRC-16 | U16 LE | 2 | 9 | CRC-16; see [CRC parameters](#crc-parameters) |
+
+```text
+A5 01 1A 04 00 UPTIME_0 UPTIME_1 UPTIME_2 UPTIME_3 CRC_LO CRC_HI
+```
+
+**Current FSW differs:** `rba_ctl` returns 0, 4, or 12 payload bytes depending on the operation. See [current rba_ctl layout](#current-rba_ctl-implementation).
 
 ##### Current rba_ctl implementation
 
@@ -1844,7 +1964,22 @@ LEV subsystem manual control
 
 **TM**
 
-TM ACK package
+**TM ACK package — PDF revision 1.0, 11 bytes total**
+
+| Field | Data type | Size (B) | Byte offset | Value / meaning |
+| --- | --- | ---: | ---: | --- |
+| START | U8 | 1 | 0 | `0xA5` |
+| ACK/ERR | U8 | 1 | 1 | `0x01` (TC TYPE) |
+| ADDR/ERRCODE | U8 | 1 | 2 | `0x22` (TC ADDR) |
+| LENGTH | U16 LE | 2 | 3 | `4` (`04 00`) |
+| System uptime (sec) | U32 LE | 4 | 5 | System uptime in seconds |
+| CRC-16 | U16 LE | 2 | 9 | CRC-16; see [CRC parameters](#crc-parameters) |
+
+```text
+A5 01 22 04 00 UPTIME_0 UPTIME_1 UPTIME_2 UPTIME_3 CRC_LO CRC_HI
+```
+
+**Current FSW:** this address is not implemented; it returns an error TM (`ACK/ERR = 0xFF`, `ERRCODE = 0x03`), not the PDF success frame above.
 
 
 #### lev_stat (0x23)
@@ -2010,7 +2145,7 @@ TC LENGTH:
 
 #### pc_ctl (0x02)
 
-Control the protein-crystallization experiment. The printed ICD called this `exp_ctl`; TYPE `0x02`, ADDR `0x02`, and its 8-byte TC/generic ACK envelope are retained. The OBC flight console and RS-422 handler implement the operations below using the existing EXP MCU CLI.
+Control the protein-crystallization experiment. The printed ICD called this `exp_ctl`; TYPE `0x02`, ADDR `0x02`, and its 8-byte TC payload are retained. The current ACK payload differs from the printed ICD; both layouts are documented below. The OBC flight console and RS-422 handler implement the operations below using the existing EXP MCU CLI.
 
 | Flight console option | Existing EXP CLI | Meaning and precondition |
 | --- | --- | --- |
@@ -2051,7 +2186,22 @@ Case `both` is the MCU default. `pc_onground standby` is an alias of `pc_standby
 
 **TM**
 
-TM ACK package
+**TM ACK package — PDF revision 1.0, 11 bytes total**
+
+| Field | Data type | Size (B) | Byte offset | Value / meaning |
+| --- | --- | ---: | ---: | --- |
+| START | U8 | 1 | 0 | `0xA5` |
+| ACK/ERR | U8 | 1 | 1 | `0x02` (TC TYPE) |
+| ADDR/ERRCODE | U8 | 1 | 2 | `0x02` (TC ADDR) |
+| LENGTH | U16 LE | 2 | 3 | `4` (`04 00`) |
+| System uptime (sec) | U32 LE | 4 | 5 | System uptime in seconds |
+| CRC-16 | U16 LE | 2 | 9 | CRC-16; see [CRC parameters](#crc-parameters) |
+
+```text
+A5 02 02 04 00 UPTIME_0 UPTIME_1 UPTIME_2 UPTIME_3 CRC_LO CRC_HI
+```
+
+**Current FSW differs:** `pc_ctl` returns an empty ACK payload, as described above: `A5 02 02 00 00 FF FF` (7 bytes total). The uptime frame above is the original PDF definition.
 
 
 #### thp_cfg (0x03)
@@ -2247,7 +2397,22 @@ LEV subsystem manual control
 
 **TM**
 
-TM ACK package
+**TM ACK package — PDF revision 1.0, 11 bytes total**
+
+| Field | Data type | Size (B) | Byte offset | Value / meaning |
+| --- | --- | ---: | ---: | --- |
+| START | U8 | 1 | 0 | `0xA5` |
+| ACK/ERR | U8 | 1 | 1 | `0x02` (TC TYPE) |
+| ADDR/ERRCODE | U8 | 1 | 2 | `0x07` (TC ADDR) |
+| LENGTH | U16 LE | 2 | 3 | `4` (`04 00`) |
+| System uptime (sec) | U32 LE | 4 | 5 | System uptime in seconds |
+| CRC-16 | U16 LE | 2 | 9 | CRC-16; see [CRC parameters](#crc-parameters) |
+
+```text
+A5 02 07 04 00 UPTIME_0 UPTIME_1 UPTIME_2 UPTIME_3 CRC_LO CRC_HI
+```
+
+**Current FSW:** this address is not implemented; it returns an error TM (`ACK/ERR = 0xFF`, `ERRCODE = 0x03`), not the PDF success frame above.
 
 
 #### rsv_op2 (0x08)
@@ -2319,6 +2484,22 @@ Data Transfer (TYPE = 0x03)
 
 List data ﬁles by type, with/without mark ﬁlter.
 
+**Source check:** `BEE-DAL_ICDr1p0 (1).pdf`, printed pages 30–31
+(PDF pages 26–27). The TM table continues onto the next PDF page; it describes
+**one response frame**, not two frames. The table below joins that continuation.
+
+**PDF versus current FSW:** the PDF TC has `LENGTH=1` and one Mark filter byte.
+Send `dat_lst 255` (or `dat_lst 0xFF`) for the PDF-compatible all-files request.
+Current FSW requires **exactly one payload byte**, as specified by the PDF.
+Zero-length and longer payloads are rejected with TC-invalid error `0x00`.
+The console and PC client require an explicit mark argument; `dat_lst` without
+an argument is rejected. There is no implicit all-files request.
+
+The PDF's three TM counters are **HK / SCI1 / SCI2**. Current FSW uses the same
+three U32 fields and offsets for **Logs / Images / Data**, respectively. Thus the
+TM byte layout matches, but the categories have been broadened as described in
+[Current three-category storage layout](#current-three-category-storage-layout).
+
 
 **TC**
 
@@ -2345,17 +2526,33 @@ Mark ﬁlter:
 | --- | --- | --- | --- | --- |
 | START | U8 | 1 | 0 | 0xA5 |
 | ACK/ERR | U8 | 1 | 1 | 0x03 |
-
-### Printed page 31 (PDF page 27)
-
-| Field | Data type | Size (B) | Byte offset | Printed value |
-| --- | --- | --- | --- | --- |
 | ADDR/ERRCODE | U8 | 1 | 2 | 0x00 |
 | LENGTH | U16 | 2 | 3 | 12 |
 | HK file count | U32 | 4 | 5 | - |
 | SCI1 file count | U32 | 4 | 9 | - |
 | SCI2 file count | U32 | 4 | 13 | - |
 | CRC-16 | U16 | 2 | 17 | - |
+
+**Frame lengths:** TC = 8 bytes (5-byte header + 1-byte filter + 2-byte CRC);
+TM = 19 bytes (5-byte header + 12-byte counts + 2-byte CRC).
+Offsets are from the START byte, not from the payload.
+
+**All-files TC example using the current FSW CRC convention** (payload-only
+CRC-16/0x1021, init 0xFFFF; little-endian fields):
+
+```text
+A5 03 00 01 00 FF 00 FF
+│  │  │  └─┬─┘ │  └─┬─┘
+│  │  │  LEN=1 mark  CRC=0xFF00
+│  │  ADDR=0x00
+│  TYPE=0x03
+START=0xA5
+```
+
+Successful TM: `A5 03 00 0C 00`, followed by the three little-endian U32 counts
+at offsets 5, 9, and 13, then the payload CRC at offsets 17–18.
+The payload-only CRC scope is the current implementation convention; the PDF
+provides CRC parameters but does not explicitly state the byte coverage.
 
 #### dat_sel (0x01)
 
@@ -2453,7 +2650,22 @@ Deselect current selected data ﬁle.
 
 **TM**
 
-TM ACK package
+**TM ACK package — PDF revision 1.0, 11 bytes total**
+
+| Field | Data type | Size (B) | Byte offset | Value / meaning |
+| --- | --- | ---: | ---: | --- |
+| START | U8 | 1 | 0 | `0xA5` |
+| ACK/ERR | U8 | 1 | 1 | `0x03` (TC TYPE) |
+| ADDR/ERRCODE | U8 | 1 | 2 | `0x03` (TC ADDR) |
+| LENGTH | U16 LE | 2 | 3 | `4` (`04 00`) |
+| System uptime (sec) | U32 LE | 4 | 5 | System uptime in seconds |
+| CRC-16 | U16 LE | 2 | 9 | CRC-16; see [CRC parameters](#crc-parameters) |
+
+```text
+A5 03 03 04 00 UPTIME_0 UPTIME_1 UPTIME_2 UPTIME_3 CRC_LO CRC_HI
+```
+
+The current FSW uses this uptime ACK layout on success.
 
 
 #### dat_del (0x04)
@@ -2506,7 +2718,22 @@ Mark/label current selected data ﬁle.
 
 **TM**
 
-TM ACK package
+**TM ACK package — PDF revision 1.0, 11 bytes total**
+
+| Field | Data type | Size (B) | Byte offset | Value / meaning |
+| --- | --- | ---: | ---: | --- |
+| START | U8 | 1 | 0 | `0xA5` |
+| ACK/ERR | U8 | 1 | 1 | `0x03` (TC TYPE) |
+| ADDR/ERRCODE | U8 | 1 | 2 | `0x05` (TC ADDR) |
+| LENGTH | U16 LE | 2 | 3 | `4` (`04 00`) |
+| System uptime (sec) | U32 LE | 4 | 5 | System uptime in seconds |
+| CRC-16 | U16 LE | 2 | 9 | CRC-16; see [CRC parameters](#crc-parameters) |
+
+```text
+A5 03 05 04 00 UPTIME_0 UPTIME_1 UPTIME_2 UPTIME_3 CRC_LO CRC_HI
+```
+
+The current FSW uses this uptime ACK layout on success.
 
 
 #### Telemetry (TYPE = 0x04)

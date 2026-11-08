@@ -1,12 +1,14 @@
 /* src/services/bee_dal_tmtc_service.c */
 #include "services/bee_dal_tmtc_service.h"
 #include "services/hk_service.h"
+#include "services/tm_payload.h"
 #include "services/obc_hk_wire.h"
 #include "services/exp_uart_service.h"
 #include "services/gui_state.h"
 #include "services/power_en.h"
 #include "services/power_stat.h"
 #include "services/sensor_stat.h"
+#include "services/sensor_cfg.h"
 #include "services/uvc_capture.h"
 #include "services/sys_info_wire.h"
 #include "services/exp_csp_service.h"
@@ -62,7 +64,7 @@ static bool is_housekeeping_read(const bee_dal_tc_frame_t *frame)
     if (frame->type == BEE_DAL_TYPE_TELEMETRY)
         return frame->addr == BEE_DAL_TM_GET || frame->addr == BEE_DAL_TM_OBC_GET;
     if (frame->type == BEE_DAL_TYPE_SYS_CFG)
-        return frame->addr == 0x04 || frame->addr == 0x07; /* pwr_stat, sen_stat */
+        return frame->addr == 0x04 || frame->addr == 0x06 || frame->addr == 0x07; /* pwr_stat, sen_stat */
     if (frame->type == BEE_DAL_TYPE_EXP_CTRL)
         return frame->addr == BEE_DAL_EXP_TLM;
     return false;
@@ -294,12 +296,15 @@ static void handle_exp_gateway(const bee_dal_tc_frame_t *f)
 /* PING (TYPE=0x00, ADDR=0x00) */
 static void handle_ping(const bee_dal_tc_frame_t *f)
 {
+    if (f->length) {send_err(BEE_DAL_ERR_TC_INVALID);return;}
     send_ack_uptime(f);
 }
 
 static void handle_sys_info(const bee_dal_tc_frame_t *f)
 {
-    if (f->length != 0) { send_err(BEE_DAL_ERR_TC_INVALID); return; }
+    if (f->length != 0 && (f->length != 1 || f->payload[0] != 1)) {
+        send_err(BEE_DAL_ERR_TC_INVALID); return;
+    }
     uint8_t payload[SYS_INFO_PAYLOAD_SIZE] = {0};
     payload[0] = SYS_INFO_SCHEMA;
     payload[1] = 3;
@@ -342,17 +347,23 @@ static void handle_sys_info(const bee_dal_tc_frame_t *f)
     obc[6] = DAL_OBC_VERSION_MINOR;
     obc[7] = DAL_OBC_VERSION_PATCH;
     payload[2] = (uint8_t)((pdu[1] ? 1U : 0U) | (exp[1] ? 2U : 0U) | 4U);
+    /* Self-test is a non-actuating identity/connectivity diagnostic. */
+    if (f->length == 1) payload[3] = (uint8_t)(0x80u | payload[2]);
     send_ack(f, payload, sizeof(payload));
 }
 
 /* pwr_adj_cfg: VOUT setpoint in mV. The PDU handles TRANS power sequencing. */
 static void handle_pwr_adj_cfg(const bee_dal_tc_frame_t *f)
 {
-    if (f->length != 0 && f->length != 2) {
+    if (f->length != 0 && f->length != 8) {
         send_err(BEE_DAL_ERR_TC_INVALID);
         return;
     }
-    bool set = f->length == 2;
+    bool set = f->length == 8;
+    if (set) {
+        for (unsigned i = 2; i < 8; ++i)
+            if (f->payload[i]) { send_err(BEE_DAL_ERR_DATA); return; }
+    }
     uint16_t target_mv = 0;
     if (set) {
         size_t off = 0;
@@ -384,6 +395,71 @@ static void handle_sensor_stat(const bee_dal_tc_frame_t *f)
                                 payload,sizeof(payload),&length);
     if (result!=0) {send_err(result==-2 ? BEE_DAL_ERR_DATA : BEE_DAL_ERR_UNKNOWN);return;}
     send_ack(f,payload,(uint16_t)length);
+}
+
+/* v1.2 native configuration; existing 01/07 sensor extension is retained. */
+static void handle_sensor_cfg(const bee_dal_tc_frame_t *f)
+{
+    uint8_t out[8];
+    int rc=sensor_cfg_execute(f->payload,f->length,out);
+    if (rc) {send_err(rc==-2 ? BEE_DAL_ERR_TC_INVALID : BEE_DAL_ERR_DATA);return;}
+    send_ack(f,out,sizeof(out));
+}
+
+/* ICD 1.2 compact I16 reports. The PDF leaves channel ordering to DAL.
+ * Each group starts with a U16 valid mask, followed by fixed I16 channels. */
+static void sensor_compact_group(unsigned group, uint8_t *out, size_t *length)
+{
+    unsigned count = group == 1 ? 11 : group == 2 ? 3 : group == 3 ? 7 : 4;
+    memset(out, 0, 2 + 2 * count);
+    for (unsigned i = 0; i < count; ++i) {
+        size_t at = 2 + 2 * i;
+        bee_dal_put_i16(out, &at, INT16_MIN);
+    }
+    for (unsigned board = 3; board <= 5; ++board) {
+        if (group != 1 && board != 4) continue;
+        uint8_t raw[SENSOR_STAT_MAX_PAYLOAD]; size_t n = 0;
+        if (sensor_stat_read(board, group, 0, 0, raw, sizeof(raw), &n)) continue;
+        for (unsigned i = 0; i < raw[4]; ++i) {
+            const uint8_t *r = raw + 10 + 12 * i;
+            int channel = -1;
+            if (group == 1) {
+                if (r[0] == 1 && r[1] == 0) channel = board == 3 ? 0 : board == 5 ? 5 : 6;
+                if (r[0] == 2 && r[1] >= 1 && r[1] <= 4 && board != 5)
+                    channel = (board == 3 ? 0 : 6) + r[1];
+            } else if (group == 4) {
+                if (r[0] >= 5 && r[0] <= 6 && r[1] >= 1 && r[1] <= 2)
+                    channel = 2 * (r[0] - 5) + r[1] - 1;
+            } else if (r[1] >= 1 && r[1] <= count) channel = r[1] - 1;
+            if (channel < 0 || !(r[2] & 1)) continue;
+            size_t at = 8;
+            int32_t value = (int32_t)bee_dal_get_u32(r, &at);
+            if (group == 2 && r[1] == 2) value /= 10;
+            if (group == 3 && r[1] >= 5) value /= 1000;
+            if (group == 4 && r[1] == 1) value /= 100;
+            if (value <= INT16_MIN || value > INT16_MAX) continue;
+            out[channel / 8] |= (uint8_t)(1u << (channel % 8));
+            at = 2 + 2 * channel;
+            bee_dal_put_i16(out, &at, (int16_t)value);
+        }
+    }
+    *length = 2 + 2 * count;
+}
+
+static void handle_sensor_stat_v12(const bee_dal_tc_frame_t *f)
+{
+    if (f->length != 1 || f->payload[0] > 4) {
+        send_err(BEE_DAL_ERR_TC_INVALID); return;
+    }
+    uint8_t out[58]; size_t length = 0;
+    unsigned report = f->payload[0];
+    for (unsigned group = 1; group <= 4; ++group) {
+        if (report && report != group) continue;
+        size_t n;
+        sensor_compact_group(group, out + length, &n);
+        length += n;
+    }
+    send_ack(f, out, (uint16_t)length);
 }
 
 static int thermal_hex(char c)
@@ -452,6 +528,8 @@ static void handle_fld_cfg(const bee_dal_tc_frame_t *f)
     char command[96], reply[4096];
     const uint8_t *p = f->payload;
     if (f->length != 0 && f->length != 32) { send_err(BEE_DAL_ERR_TC_INVALID); return; }
+    if ((f->addr == 0x16 || (f->type == 2 && f->addr == 1)) &&
+        f->length == 32 && p[0] != 1) {send_err(BEE_DAL_ERR_DATA);return;}
     if (f->length == 0 || p[0] == 0) {
         unsigned page = f->length ? p[1] : 0;
         if (exp_uart_command("cfg_json_pc", reply, sizeof(reply)) != 0) {
@@ -618,8 +696,15 @@ static void handle_pc_cfg(const bee_dal_tc_frame_t *f)
 
 static void handle_thp_cfg(const bee_dal_tc_frame_t *f)
 {
-    if (f->length!=32) {send_err(BEE_DAL_ERR_TC_INVALID);return;}
-    const uint8_t *p=f->payload;
+    if ((f->addr == 0x03 && f->length != 0 && f->length != 32) ||
+        (f->addr == 0x10 && f->length != 32)) {
+        send_err(BEE_DAL_ERR_TC_INVALID); return;
+    }
+    const uint8_t default_profile[32] = {0};
+    const uint8_t *p = f->length ? f->payload : default_profile;
+    if (f->addr == 0x03 && f->length && p[0] != 1) {
+        send_err(BEE_DAL_ERR_DATA); return;
+    }
     if (p[0]>1 || p[1]>1 || p[2]>=(p[1]?2:4)) {send_err(BEE_DAL_ERR_DATA);return;}
     if (!p[0]) {
         for (unsigned i=3;i<32;i++) if (p[i]) {send_err(BEE_DAL_ERR_DATA);return;}
@@ -651,8 +736,8 @@ static void handle_thp_cfg(const bee_dal_tc_frame_t *f)
 
 static void handle_thp_ctl(const bee_dal_tc_frame_t *f)
 {
-    if (f->length!=1) {send_err(BEE_DAL_ERR_TC_INVALID);return;}
-    uint8_t selector=f->payload[0];
+    if (f->length > 1) {send_err(BEE_DAL_ERR_TC_INVALID);return;}
+    uint8_t selector = f->length ? f->payload[0] : 0;
     unsigned channel=selector&3u,kind=(selector>>2)&1u,action=(selector>>3)&3u;
     if ((selector&0xe0u) || (kind && (channel>1u || action==3u))) {
         send_err(BEE_DAL_ERR_DATA);return;
@@ -706,7 +791,7 @@ static void handle_pc_ctl(const bee_dal_tc_frame_t *f)
                 (int)strcspn(reason, "\r\n"), reason);
         send_err(BEE_DAL_ERR_DATA);return;
     }
-    send_ack(f,NULL,0);
+    send_ack_uptime(f);
 }
 
 static bool icd_can_required(void)
@@ -783,10 +868,13 @@ static void handle_fld_ctl(const bee_dal_tc_frame_t *f)
             if (sscanf(queued,"Pump request QUEUED id=%lu",&id)!=1 ||
                 id==0 || id>UINT32_MAX) {send_err(BEE_DAL_ERR_DATA);return;}
             uint8_t result[4]={(uint8_t)id,(uint8_t)(id>>8),(uint8_t)(id>>16),(uint8_t)(id>>24)};
-            send_ack(f,result,sizeof(result));return;
+            if (f->addr == 0x34) send_ack(f,result,sizeof(result));
+            else send_ack_uptime(f);
+            return;
         }
     }
-    send_ack(f,NULL,0);
+    if (f->addr == 0x34 || f->addr == 0x33) send_ack(f,NULL,0);
+    else send_ack_uptime(f);
 }
 
 /* 01/1A: one fixed-width manual motor request, translated to the EXP CLI. */
@@ -831,6 +919,7 @@ static void handle_rba_ctl(const bee_dal_tc_frame_t *f)
     case 6: snprintf(command,sizeof(command),"motor5_stop %s",p[1]==2?"all":p[1]==0?"0":"1");break;
     case 7: snprintf(command,sizeof(command),"motor5_disable");break;
     case 8:
+        if (f->addr != 0x33) {send_err(BEE_DAL_ERR_DATA);return;}
         if (!value) {send_err(BEE_DAL_ERR_DATA);return;}
         snprintf(command,sizeof(command),"motor5_result %u",value);break;
     case 9: snprintf(command,sizeof(command),"motor5_stop %u hold",p[1]);break;
@@ -843,7 +932,9 @@ static void handle_rba_ctl(const bee_dal_tc_frame_t *f)
         if (!strstr(reply,accepted)) {
             send_err(BEE_DAL_ERR_DATA);return;
         }
-        send_ack(f,NULL,0);return;
+        if (f->addr == 0x33) send_ack(f,NULL,0);
+        else send_ack_uptime(f);
+        return;
     }
     static const char *const states[]={"QUEUED","ACCEPTED","DONE","INVALID","BUSY",
         "NOT_READY","REFUSED","NOT_HOMED","LIMIT_REACHED","FAULT","POWER_LOST",
@@ -870,7 +961,8 @@ static void handle_rba_ctl(const bee_dal_tc_frame_t *f)
         send_ack(f,out,sizeof(out));return;
     }
     uint8_t out[4];for (unsigned i=0;i<4;i++) out[i]=(uint8_t)(id>>(8*i));
-    send_ack(f,out,sizeof(out));
+    if (f->addr == 0x33) send_ack(f,out,sizeof(out));
+    else send_ack_uptime(f);
 }
 
 static void handle_fld_stat(const bee_dal_tc_frame_t *f)
@@ -1017,7 +1109,8 @@ static void handle_thm_stat(const bee_dal_tc_frame_t *f)
             if ((cached[i]&0x7fu)>100u || ((cached[i]&0x80u) && !(cached[i]&0x7fu))) {
                 send_err(BEE_DAL_ERR_DATA);return;
             }
-        send_ack(f,cached,sizeof(cached));return;
+        uint8_t out[8]={0};memcpy(out,cached,6);
+        send_ack(f,out,sizeof(out));return;
     }
     if (icd_can_required()) {send_err(BEE_DAL_ERR_UNKNOWN);return;}
     char reply[256];
@@ -1027,7 +1120,7 @@ static void handle_thm_stat(const bee_dal_tc_frame_t *f)
     char *marker=strstr(reply,"THM_STAT6 ");
     if (!marker || strlen(marker+10)<12u) {send_err(BEE_DAL_ERR_DATA);return;}
     marker+=10;
-    uint8_t out[6];
+    uint8_t out[8]={0};
     for (unsigned i=0;i<6u;i++) {
         int hi=thermal_hex(marker[2*i]),lo=thermal_hex(marker[2*i+1]);
         if (hi<0 || lo<0) {send_err(BEE_DAL_ERR_DATA);return;}
@@ -1041,8 +1134,11 @@ static void handle_thm_stat(const bee_dal_tc_frame_t *f)
 
 static void handle_uvc_cfg(const bee_dal_tc_frame_t *f)
 {
-    if (f->length != 1 && f->length != 32) { send_err(BEE_DAL_ERR_TC_INVALID); return; }
-    uint8_t camera = f->payload[0];
+    if ((f->addr == 0x10 && f->length != 0 && f->length != 32) ||
+        (f->addr == 0x30 && f->length != 1)) {
+        send_err(BEE_DAL_ERR_TC_INVALID); return;
+    }
+    uint8_t camera = f->length ? f->payload[0] : 1;
     uint16_t mask = f->length == 32 ? (uint16_t)f->payload[2] | ((uint16_t)f->payload[3] << 8) : 0;
     if (camera < 1 || camera > 4 || (f->length == 32 &&
         (f->payload[1] != 1 || f->payload[31] > 100 || (mask & 0xe000) ||
@@ -1062,7 +1158,7 @@ static void handle_uvc_cfg(const bee_dal_tc_frame_t *f)
     if (pid == 0) {
         dup2(pipes[1], STDOUT_FILENO);
         close(pipes[0]); close(pipes[1]);
-        if (f->length == 1) execl(tool, tool, camera_arg, "--uvc-get", (char *)NULL);
+        if (f->length != 32) execl(tool, tool, camera_arg, "--uvc-get", (char *)NULL);
         else execl(tool, tool, camera_arg, "--uvc-set", hex, (char *)NULL);
         _exit(127);
     }
@@ -1099,11 +1195,18 @@ static void handle_uvc_ctl(const bee_dal_tc_frame_t *f)
     uint8_t reply[8];
     int rc = uvc_capture_queue(f->payload[0], id, reply);
     if (rc) { send_err(rc == -2 ? BEE_DAL_ERR_DATA : BEE_DAL_ERR_UNKNOWN); return; }
-    send_ack(f, reply, sizeof(reply));
+    if (f->addr == 0x35) send_ack(f, reply, sizeof(reply));
+    else send_ack_uptime(f);
 }
 
 static void handle_uvc_stat(const bee_dal_tc_frame_t *f)
 {
+    if (f->addr == 0x12) {
+        if (f->length) {send_err(BEE_DAL_ERR_TC_INVALID);return;}
+        uint8_t summary[6];
+        uvc_capture_summary(summary);
+        send_ack(f, summary, sizeof(summary));return;
+    }
     if (f->length != 5) { send_err(BEE_DAL_ERR_TC_INVALID); return; }
     size_t off = 1;
     uint32_t id = bee_dal_get_u32(f->payload, &off);
@@ -1115,7 +1218,7 @@ static void handle_uvc_stat(const bee_dal_tc_frame_t *f)
 
 
 /* pwr_en: board U8; optional select U16, on U16, flags U8. */
-static void handle_power_en(const bee_dal_tc_frame_t *f)
+static void handle_power_select(const bee_dal_tc_frame_t *f)
 {
     if (f->length!=1 && f->length!=6) { send_err(BEE_DAL_ERR_TC_INVALID); return; }
     uint8_t board=f->payload[0];
@@ -1140,6 +1243,40 @@ static void handle_power_en(const bee_dal_tc_frame_t *f)
     bee_dal_put_u16(payload,&off,result.known);
     bee_dal_put_u16(payload,&off,result.failed);
     send_ack(f,payload,sizeof(payload));
+}
+
+/* ICD 01/03: selected global rail mask (bits 0..12), desired on (13),
+ * force EXP off (14), reserved (15). GET is empty. TM: on[12:0],
+ * full-board readback-valid flags OBC/EXP/PDU in bits 13/14/15. */
+static void handle_power_en(const bee_dal_tc_frame_t *f)
+{
+    if (f->length != 0 && f->length != 2) {send_err(BEE_DAL_ERR_TC_INVALID);return;}
+    size_t at = 0;
+    uint16_t request = f->length ? bee_dal_get_u16(f->payload, &at) : 0;
+    uint16_t selected = request & 0x1fffu;
+    bool on = (request & 0x2000u) != 0, force = (request & 0x4000u) != 0;
+    if (f->length && (!selected || (request & 0x8000u) ||
+        (force && (on || (selected & ~0x0700u))))) {
+        send_err(BEE_DAL_ERR_DATA);return;
+    }
+    static const unsigned shifts[] = {0, 8, 11};
+    static const uint16_t masks[] = {0xff, 7, 3};
+    uint16_t status = 0; bool any = false, failed = false;
+    for (unsigned i = 0; i < 3; ++i) {
+        uint16_t select = (selected >> shifts[i]) & masks[i];
+        power_en_result_t result = {0};
+        int rc = power_en_execute((uint8_t)(3 + i), select, on ? select : 0,
+                                 force && i == 1 ? 1 : 0, &result);
+        if (!rc) {
+            status |= (uint16_t)((result.on & result.known & masks[i]) << shifts[i]);
+            if ((result.known & masks[i]) == masks[i]) status |= (uint16_t)(1u << (13 + i));
+            any = true;
+        }
+        if (select && (rc || result.failed || (select & ~result.known))) failed = true;
+    }
+    if (failed || !any) {send_err(BEE_DAL_ERR_DATA);return;}
+    uint8_t out[2]; at = 0; bee_dal_put_u16(out, &at, status);
+    send_ack(f, out, sizeof(out));
 }
 
 /* Local extension: clear the PDU eFuse fault latch (Modbus coil 00003). */
@@ -1191,13 +1328,11 @@ static void handle_pdu_bootloader(const bee_dal_tc_frame_t *f)
 
 static void handle_power_stat(const bee_dal_tc_frame_t *f)
 {
-    if (f->length!=3) { send_err(BEE_DAL_ERR_TC_INVALID); return; }
-    uint16_t mask=(uint16_t)(f->payload[1]|((uint16_t)f->payload[2]<<8));
-    uint8_t payload[POWER_STAT_MAX_PAYLOAD];
-    size_t length=0;
-    int rc=power_stat_read(f->payload[0],mask,payload,sizeof(payload),&length);
-    if (rc==-2) { send_err(BEE_DAL_ERR_DATA); return; }
-    if (rc!=0) { send_err(BEE_DAL_ERR_UNKNOWN); return; }
+    if (f->length!=1 || f->payload[0]>3) {send_err(BEE_DAL_ERR_TC_INVALID);return;}
+    uint8_t payload[POWER_STAT_V12_MAX_PAYLOAD];size_t length=0;
+    if (power_stat_report(f->payload[0],payload,sizeof(payload),&length)!=0 || length>200) {
+        send_err(BEE_DAL_ERR_DATA);return;
+    }
     send_ack(f,payload,(uint16_t)length);
 }
 
@@ -1275,18 +1410,9 @@ static uint16_t g_dat_chunk_size   = 0;
 
 static void handle_dat_lst(const bee_dal_tc_frame_t *f)
 {
+    if (f->length != 1) { send_err(BEE_DAL_ERR_TC_INVALID); return; }
+    uint8_t mark_filt = f->payload[0];
     g_dat_selected = false;
-
-    uint8_t mark_filt = BEE_DAL_FILES_MARK_ALL;
-    if (f->length >= 1) {
-        size_t off = 0;
-        mark_filt = bee_dal_get_u8(f->payload, &off);
-        if (f->length != 1) {
-            fprintf(stderr, "[BEE-DAL] dat_lst: TC length=%u, expected 0 or 1 -- "
-                            "using first byte as filter, ignoring %u extra\n",
-                    (unsigned)f->length, (unsigned)(f->length - 1));
-        }
-    }
 
     uint32_t hk_count = 0, sci1_count = 0, sci2_count = 0;
     if (bee_dal_files_scan(mark_filt, &g_dat_snap_id, &hk_count, &sci1_count, &sci2_count) != XERR_OK) {
@@ -1303,19 +1429,11 @@ static void handle_dat_lst(const bee_dal_tc_frame_t *f)
 
 static void handle_dat_sel(const bee_dal_tc_frame_t *f)
 {
-    if (f->length < 5) { send_err(BEE_DAL_ERR_TC_INVALID); return; }
-    if (f->length != 5) {
-        /* Diagnostic only -- does not change accept/reject behavior. */
-        fprintf(stderr, "[BEE-DAL] dat_sel: TC length=%u, expected exactly 5 -- "
-                        "using first 5 bytes, ignoring %u extra\n",
-                (unsigned)f->length, (unsigned)(f->length - 5));
-    }
-
-    g_dat_selected = false;
+    if (f->length != 7) { send_err(BEE_DAL_ERR_TC_INVALID); return; }
 
     size_t   off        = 0;
     uint8_t  data_type   = bee_dal_get_u8(f->payload, &off);
-    uint32_t data_index  = bee_dal_get_u16(f->payload, &off);
+    uint32_t data_index  = bee_dal_get_u32(f->payload, &off);
     uint16_t chunk_size  = bee_dal_get_u16(f->payload, &off);
 
     if (data_type > BEE_DAL_DATA_TYPE_SCI2) { send_err(BEE_DAL_ERR_TC_INVALID); return; }
@@ -1345,8 +1463,7 @@ static void handle_dat_sel(const bee_dal_tc_frame_t *f)
     g_dat_index      = data_index;
     g_dat_chunk_size = chunk_size;
 
-    uint32_t chunk_count = (size + chunk_size - 1) / chunk_size;
-    if (chunk_count == 0) chunk_count = 1;
+    uint32_t chunk_count = size / chunk_size + (size % chunk_size != 0);
 
     uint8_t payload[41];
     size_t  poff = 0;
@@ -1365,12 +1482,7 @@ static void handle_dat_sel(const bee_dal_tc_frame_t *f)
  * one chunk of the file currently selected by dat_sel. */
 static void handle_dat_get(const bee_dal_tc_frame_t *f)
 {
-    if (f->length < 4) { send_err(BEE_DAL_ERR_TC_INVALID); return; }
-    if (f->length != 4) {
-        fprintf(stderr, "[BEE-DAL] dat_get: TC length=%u, expected exactly 4 -- "
-                        "using first 4 bytes, ignoring %u extra\n",
-                (unsigned)f->length, (unsigned)(f->length - 4));
-    }
+    if (f->length != 4) { send_err(BEE_DAL_ERR_TC_INVALID); return; }
 
     if (!g_dat_selected) { send_err(BEE_DAL_ERR_DATA); return; }
 
@@ -1392,6 +1504,7 @@ static void handle_dat_get(const bee_dal_tc_frame_t *f)
 
 static void handle_dat_des(const bee_dal_tc_frame_t *f)
 {
+    if (f->length != 0) { send_err(BEE_DAL_ERR_TC_INVALID); return; }
     g_dat_selected = false;
     send_ack_uptime(f);
 }
@@ -1427,12 +1540,7 @@ static void handle_dat_del(const bee_dal_tc_frame_t *f)
 
 static void handle_dat_mark(const bee_dal_tc_frame_t *f)
 {
-    if (f->length < 1) { send_err(BEE_DAL_ERR_TC_INVALID); return; }
-    if (f->length != 1) {
-        fprintf(stderr, "[BEE-DAL] dat_mark: TC length=%u, expected exactly 1 -- "
-                        "using first byte, ignoring %u extra\n",
-                (unsigned)f->length, (unsigned)(f->length - 1));
-    }
+    if (f->length != 1) { send_err(BEE_DAL_ERR_TC_INVALID); return; }
 
     size_t  off  = 0;
     uint8_t mark = bee_dal_get_u8(f->payload, &off);
@@ -1449,30 +1557,13 @@ static void handle_dat_mark(const bee_dal_tc_frame_t *f)
     send_ack_uptime(f);
 }
 
-/* tm_get (TYPE=0x04, ADDR=0x00): 29-byte payload */
+/* ICD v1.2 TYPE 04/00: 57-byte payload, 64-byte TM, CRC at offset 62. */
 static void handle_tm_get(const bee_dal_tc_frame_t *f)
 {
-    bee_dal_telemetry_t tm;
-    hk_service_get_telemetry(&tm);
-    if (!tm.obc_snapshot_valid) { send_err(BEE_DAL_ERR_DATA); return; }
-
-    uint8_t payload[29];
-    size_t  off = 0;
-    bee_dal_put_u32(payload, &off, tm.sys_time_epoch);
-    bee_dal_put_i8 (payload, &off, tm.sys_status);
-    bee_dal_put_u32(payload, &off, tm.bootcount);
-    bee_dal_put_i16(payload, &off, tm.onboard_temp_c);
-    bee_dal_put_i16(payload, &off, tm.baro_temp_c);
-    bee_dal_put_u16(payload, &off, tm.baro_press_pa);
-    bee_dal_put_u16(payload, &off, tm.baro_hum_rh);
-    bee_dal_put_i16(payload, &off, tm.mlx_temp_c);
-    bee_dal_put_u16(payload, &off, tm.mlx_status);
-    bee_dal_put_i16(payload, &off, tm.slf_temp_c);
-    bee_dal_put_i16(payload, &off, tm.slf_flow_rate);
-    bee_dal_put_u16(payload, &off, tm.rba_status);
-    bee_dal_put_u16(payload, &off, tm.ta_status);
-
-    send_ack(f, payload, (uint16_t)off);
+    if(f->length!=0) {send_err(BEE_DAL_ERR_TC_INVALID);return;}
+    uint8_t payload[TM_GET_V12_LEN];
+    if(tm_get_encode(payload)!=0) {send_err(BEE_DAL_ERR_DATA);return;}
+    send_ack(f,payload,sizeof(payload));
 }
 
 static void handle_tm_obc_get(const bee_dal_tc_frame_t *f)
@@ -1734,6 +1825,8 @@ static void dispatch(const bee_dal_tc_frame_t *f)
         case 0x02: handle_pwr_adj_cfg(f); return;
         case 0x03: handle_power_en(f); return;
         case 0x04: handle_power_stat(f); return;
+        case 0x05: handle_sensor_cfg(f); return;
+        case 0x06: handle_sensor_stat_v12(f); return;
         case 0x07: handle_sensor_stat(f); return;
         case 0x10: handle_uvc_cfg(f); return;
         case 0x11: handle_uvc_ctl(f); return;
@@ -1749,6 +1842,14 @@ static void dispatch(const bee_dal_tc_frame_t *f)
         case 0x1c: handle_pdu_fault_clear(f); return;
         case 0x1d: handle_pdu_heartbeat(f); return;
         case 0x1e: handle_pdu_bootloader(f); return;
+        /* DAL extensions: never change the native ICD payload contracts. */
+        case 0x30: handle_uvc_cfg(f); return;
+        case 0x31: handle_uvc_stat(f); return;
+        case 0x32: handle_power_select(f); return;
+        case 0x33: handle_rba_ctl(f); return;
+        case 0x34: handle_fld_ctl(f); return;
+        case 0x35: handle_uvc_ctl(f); return;
+        case 0x36: handle_fld_cfg(f); return;
         default:
             send_err(BEE_DAL_ERR_UNKNOWN); 
             return;
@@ -1781,6 +1882,8 @@ static void dispatch(const bee_dal_tc_frame_t *f)
         if (f->addr==0x02) {handle_pc_ctl(f);return;}
         if (f->addr==0x03) {handle_thp_cfg(f);return;}
         if (f->addr==0x04) {handle_thp_ctl(f);return;}
+        if (f->addr==0x10) {handle_thp_cfg(f);return;}
+        if (f->addr==0x12) {handle_pc_cfg(f);return;}
         if (f->addr==BEE_DAL_EXP_CSP_SUBMIT) {handle_exp_csp_submit(f);return;}
         if (f->addr==BEE_DAL_EXP_CSP_RESULT) {handle_exp_csp_result(f);return;}
         if (f->addr==BEE_DAL_EXP_CSP_SNAPSHOT) {handle_exp_csp_snapshot(f);return;}

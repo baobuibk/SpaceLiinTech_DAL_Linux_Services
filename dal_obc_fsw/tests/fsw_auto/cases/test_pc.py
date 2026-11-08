@@ -49,7 +49,7 @@ class PcControl(FswTestCase):
         for (op, sel), (command, _) in GOOD.items():
             with self.subTest(op=op, sel=sel):
                 self.seen = len(self.fsw.exp.commands)
-                self.link.txrx(2, CTL, tc(op, sel)).expect_ack(2, CTL, 0)
+                self.link.txrx(2, CTL, tc(op, sel)).expect_ack(2, CTL, 4)
                 self.assertEqual(self.sent(), [command])
 
     def test_pc_02_invalid_requests_are_rejected_without_touching_the_exp(self):
@@ -77,8 +77,8 @@ class PcControl(FswTestCase):
         self.fsw.exp.responder = lambda c: "pc already activated" if "activate" in c and "de" not in c \
             else "pc already deactivated"
         try:
-            self.link.txrx(2, CTL, tc(1)).expect_ack(2, CTL, 0)
-            self.link.txrx(2, CTL, tc(2)).expect_ack(2, CTL, 0)
+            self.link.txrx(2, CTL, tc(1)).expect_ack(2, CTL, 4)
+            self.link.txrx(2, CTL, tc(2)).expect_ack(2, CTL, 4)
         finally:
             self.fsw.exp.responder = respond
 

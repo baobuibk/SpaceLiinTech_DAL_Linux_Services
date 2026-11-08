@@ -211,7 +211,7 @@ def main():
         info = fsw.console.run("sys_info")
         assert "EXP online hardware=1.1.0 firmware=1.0.0 build=20261101abc" in info, info
         assert "version" not in fsw.exp.commands, fsw.exp.commands
-        for command, expected in (("thm_stat", bytes([10,20,30,40,50,60])),
+        for command, expected in (("thm_stat", bytes([10,20,30,40,50,60,0,0])),
                                   ("fld_stat", bytes([1,2]+[0]*14)),
                                   ("rba_stat", bytes([1,1,1]+[0]*13)),
                                   ("pc_stat", bytes([1]))):
@@ -221,10 +221,10 @@ def main():
         rail = json.loads(fsw.console.run("--json", "pwr_en", "EXP", "get"))
         assert rail["ok"] and bytes.fromhex(rail["payload_hex"]) == \
             bytes.fromhex("04 05 00 07 00 00 00"), rail
-        power = json.loads(fsw.console.run("--json", "pwr_stat", "EXP", "get"))
-        assert power["ok"] and power["length"] == 90, power
-        records = bytes.fromhex(power["payload_hex"])[6:]
-        assert [records[i * 12 + 1] for i in (4, 5, 6)] == [0x13, 0x11, 0x13], power
+        power = json.loads(fsw.console.run("--json", "pwr_stat", "all"))
+        assert power["ok"] and power["length"] == 184, power
+        records = bytes.fromhex(power["payload_hex"])[6:-16]
+        assert [(int.from_bytes(records[i:i+2],"little")>>7)&31 for i in range(0,len(records),6) if ((int.from_bytes(records[i:i+2],"little")>>4)&7)==4 and (int.from_bytes(records[i:i+2],"little")&15)>=4] == [0x13,0x11,0x13],power
         assert fsw.exp.commands.count("power_all_get") == before_uart
         tm = fsw.link.txrx(2, 0x0f, b"\x06")
         assert not tm.is_err and json.loads(tm.payload)["data"]["boot_id"] == 9

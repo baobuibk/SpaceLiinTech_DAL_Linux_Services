@@ -15,7 +15,7 @@ SOURCES = src/main.c src/services/hk_service.c src/services/bee_dal_tmtc_service
           src/services/flight_console_service.c \
           src/services/port_config.c \
           src/services/gui_state.c \
-          src/services/sensor_stat.c \
+          src/services/sensor_stat.c src/services/sensor_cfg.c src/services/tm_payload.c \
           src/services/uvc_capture.c \
           src/services/power_en.c \
           src/services/power_stat.c \
@@ -71,7 +71,15 @@ build-host/test_port_config: tests/test_port_config.c src/services/port_config.c
 	install -d build-host
 	$(HOSTCC) $(COMMON_FLAGS) -o $@ tests/test_port_config.c src/services/port_config.c
 
-check: build-host/dal_obc_fsw build-host/dal_flight_console build-host/test_obc_hk_wire \
+build-host/test_sensor_cfg: tests/test_sensor_cfg.c src/services/sensor_cfg.c $(HEADERS)
+	install -d build-host
+	$(HOSTCC) $(COMMON_FLAGS) -o $@ tests/test_sensor_cfg.c src/services/sensor_cfg.c
+
+build-host/test_power_stat_v12: tests/test_power_stat_v12.c src/services/power_stat.c $(HEADERS)
+	install -d build-host
+	$(HOSTCC) $(COMMON_FLAGS) -o $@ tests/test_power_stat_v12.c src/services/power_stat.c lib/bee_dal_proto/src/bee_dal_proto.c lib/bee_dal_proto/src/bee_dal_crc16.c -lm
+
+check: build-host/test_power_stat_v12 build-host/test_sensor_cfg build-host/dal_obc_fsw build-host/dal_flight_console build-host/test_obc_hk_wire build-host/test_tm_payload \
        build-host/test_obc_snapshot build-host/test_hk_csv_files build-host/test_exp_uart_probe build-host/test_port_config
 	./build-host/dal_obc_fsw --help >/dev/null
 	./build-host/dal_flight_console --help >/dev/null
@@ -79,6 +87,9 @@ check: build-host/dal_obc_fsw build-host/dal_flight_console build-host/test_obc_
 	./build-host/test_obc_snapshot
 	./build-host/test_hk_csv_files
 	./build-host/test_port_config
+	./build-host/test_sensor_cfg
+	./build-host/test_tm_payload
+	./build-host/test_power_stat_v12
 	python3 tests/test_exp_uart.py
 	python3 tests/test_flight_console.py
 	python3 tests/test_exp_csp.py
@@ -110,3 +121,7 @@ deploy: target
 
 clean:
 	rm -rf build-host build-target
+
+build-host/test_tm_payload: tests/test_tm_payload.c src/services/tm_payload.c
+	install -d build-host
+	$(HOSTCC) $(COMMON_FLAGS) -o $@ $^ lib/bee_dal_proto/src/bee_dal_proto.c lib/bee_dal_proto/src/bee_dal_crc16.c -lm

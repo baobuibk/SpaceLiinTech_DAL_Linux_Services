@@ -158,3 +158,21 @@ int uvc_capture_status(uint8_t camera, uint32_t request_id, uint8_t reply[8])
     encode(camera, state, error, request_id, reply);
     return 0;
 }
+
+void uvc_capture_summary(uint8_t reply[6])
+{
+    uint16_t states = 0, errors = 0, known = 0;
+    pthread_mutex_lock(&lock);
+    for (unsigned camera = 0; camera < 4; ++camera) {
+        if (!next_slot[camera]) continue;
+        job_state_t *entry = &history[camera][(next_slot[camera] - 1) % UVC_HISTORY];
+        if (!entry->id) continue;
+        states |= (uint16_t)((entry->state & 15u) << (4 * camera));
+        errors |= (uint16_t)((entry->error & 15u) << (4 * camera));
+        known |= (uint16_t)(1u << camera);
+    }
+    pthread_mutex_unlock(&lock);
+    reply[0] = (uint8_t)states; reply[1] = (uint8_t)(states >> 8);
+    reply[2] = (uint8_t)errors; reply[3] = (uint8_t)(errors >> 8);
+    reply[4] = (uint8_t)known; reply[5] = (uint8_t)(known >> 8);
+}

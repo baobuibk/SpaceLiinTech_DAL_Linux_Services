@@ -177,7 +177,7 @@ class BeeDalRepl(cmd.Cmd):
             print("for multiple outputs: set <select_mask> <on_mask> [force for EXP off]")
             return
         timeout = max(self.timeout, 15.0 * (selected_count + 1)) if addr == 4 else self.timeout
-        reply = self.link.txrx(0x01, 0x03, payload, timeout_s=timeout)
+        reply = self.link.txrx(0x01, 0x32, payload, timeout_s=timeout)
         if reply is None:
             return
         if len(reply) != 7 or reply[0] != addr:
@@ -187,55 +187,36 @@ class BeeDalRepl(cmd.Cmd):
         print(f"    on=0x{on:04X} known=0x{known:04X} failed=0x{failed:04X}")
 
     def do_pwr_stat(self, arg):
-        "pwr_stat <OBC|EXP|PDU> get [source|all|mask <mask>] -- power measurements and switch states"
-        names = {
-            "OBC": ("5V_SAMA7", "5V_FPGA", "3V3", "5V_AI", "PMIC_3V3",
-                    "PMIC_DDR_1V35", "PMIC_CORE_1V15", "PMIC_CPU_1V15",
-                    "AI_power", "FPGA_power", "USB1_power", "USB2_power",
-                    "USB3_power", "USB4_power", "MIPI1_power", "MIPI2_power"),
-            "EXP": ("12V_MOTOR", "12V_EXP", "5V_EXP", "5V_SLN_HD",
-                    "EXP12V", "SLN_HD", "MOTOR"),
-            "PDU": ("VOUT", "TRANS", "INPUT_12V", "INPUT_5V"),
-        }
-        parts = arg.split()
-        if len(parts) < 2 or parts[0].upper() not in names or parts[1].lower() != "get":
-            print("usage: pwr_stat <OBC|EXP|PDU> get [source|all|mask <mask>]")
+        "pwr_stat all|monitor|enable|error -- ICD v1.2 one-byte report selector"
+        reports = {"all": 0, "monitor": 1, "enable": 2, "error": 3}
+        name = arg.strip().lower()
+        if name not in reports:
+            print("usage: pwr_stat all|monitor|enable|error")
             return
-        board_name = parts[0].upper()
-        board = {"OBC": 3, "EXP": 4, "PDU": 5}[board_name]
-        if len(parts) == 2 or len(parts) == 3 and parts[2].lower() == "all":
-            mask = 0
-        elif len(parts) == 3 and parts[2].lower() in (n.lower() for n in names[board_name]):
-            bit = [n.lower() for n in names[board_name]].index(parts[2].lower())
-            mask = 1 << bit
-        elif len(parts) == 4 and parts[2].lower() == "mask":
-            try:
-                mask = int(parts[3], 0)
-            except ValueError:
-                mask = -1
-            if not 0 <= mask <= (1 << len(names[board_name])) - 1:
-                print("invalid source mask")
-                return
-        else:
-            print("usage: pwr_stat <OBC|EXP|PDU> get [source|all|mask <mask>]")
-            return
-        reply = self.link.txrx(0x01, 0x04, struct.pack("<BH", board, mask),
-                               timeout_s=max(self.timeout, 15.0) if board == 4 else self.timeout)
+        reply = self.link.txrx(1, 4, bytes([reports[name]]), timeout_s=max(self.timeout, 15))
         if reply is None:
             return
-        if len(reply) < 6 or reply[0] != board or len(reply) != 6 + 12 * reply[1]:
-            print("[!] invalid pwr_stat reply length or board")
+        if len(reply) < 6 or len(reply) > 200:
+            print("[!] invalid pwr_stat length")
             return
-        epoch = struct.unpack_from("<I", reply, 2)[0]
-        print(f"    board={board_name} epoch={epoch} records={reply[1]}")
-        for offset in range(6, len(reply), 12):
-            bit, flags, age, mv, ma = struct.unpack_from("<BBHIi", reply, offset)
-            name = names[board_name][bit] if bit < len(names[board_name]) else f"bit{bit}"
+        schema, count, errors = struct.unpack_from("<HHH", reply)
+        if schema != 0x200 | reports[name] or len(reply) != 22 + 6 * count or errors & ~0x8007:
+            print("[!] invalid pwr_stat header")
+            return
+        print(f"report={name} availability_errors=0x{errors & 7:04X} hardware_faults=unavailable")
+        for off in range(6, len(reply)-16, 6):
+            desc, mv, ma = struct.unpack_from("<HHh", reply, off)
+            board, source, flags = desc >> 4 & 7, desc & 15, desc >> 7 & 31
             state = "unknown" if not flags & 1 else "on" if flags & 2 else "off"
-            voltage = f"{mv} mV" if flags & 4 else "unavailable"
-            current = f"{ma} mA" if flags & 8 else "unavailable"
-            age_text = f"{age} ms" if age != 0xffff else "unavailable"
-            print(f"    {name}: state={state} voltage={voltage} current={current} age={age_text}")
+            print(f"  board={board} source={source} state={state} "
+                  f"voltage={str(mv)+' mV' if flags & 4 else 'unavailable'} "
+                  f"current={str(ma)+' mA' if flags & 8 else 'unavailable'}")
+
+        valid, flags, mode, tps, temp, age, setpoint, reserved = struct.unpack_from("<HHBBhIHH", reply, len(reply)-16)
+        names = ["UNKNOWN", "UNPOWERED", "STARTING", "READY", "COMM_ERROR"]
+        print(f"  PDU valid=0x{valid:04X} flags=0x{flags:04X} mode={mode} TPS={names[tps] if tps<5 else 'INVALID'} age_ms={age}")
+        if valid & 4:
+            print(f"  temperature={temp/10:.1f} C")
 
     def do_tm_get(self, arg):
         "tm_get -- Get payload telemetry. TYPE=0x04 ADDR=0x00"
@@ -253,6 +234,8 @@ class BeeDalRepl(cmd.Cmd):
             if name == "sys_time_epoch":
                 dt = datetime.datetime.utcfromtimestamp(val)
                 result = f"{val}  ({dt.isoformat()}Z)"
+            elif (dtype == "I16" and val == -32768) or (dtype == "U16" and val == 65535):
+                result = "unavailable"
             else:
                 result = str(val)
             rows.append((name, dtype, str(offset), str(size), result))
@@ -538,7 +521,7 @@ class BeeDalRepl(cmd.Cmd):
         else:
             print(usage)
             return
-        reply = self.link.txrx(0x01, 0x10, payload, timeout_s=max(self.timeout, 30))
+        reply = self.link.txrx(0x01, 0x30 if len(payload) == 1 else 0x10, payload, timeout_s=max(self.timeout, 30))
         if reply is None:
             return
         if len(reply) != 32 or reply[0] != camera or reply[1] != 1:
@@ -576,7 +559,10 @@ class BeeDalRepl(cmd.Cmd):
         payload = struct.pack("<BBHI", int(parts[0]), 1, 0, request_id)
         reply = self.link.txrx(0x01, 0x11, payload, timeout_s=self.timeout)
         if reply is not None:
-            self._show_uvc_capture_reply(reply, int(parts[0]), request_id)
+            if len(reply) != 4:
+                print("[!] invalid uptime ACK")
+            else:
+                print(f"    capture accepted; uptime={struct.unpack('<I', reply)[0]} s")
 
     def do_uvc_stat(self, arg):
         "uvc_stat <1|2|3|4> get <request_id> -- Read JPEG capture state. TYPE=0x01 ADDR=0x12"
@@ -590,7 +576,7 @@ class BeeDalRepl(cmd.Cmd):
         except ValueError:
             print("request_id must be 1..4294967295")
             return
-        reply = self.link.txrx(0x01, 0x12, struct.pack("<BI", int(parts[0]), request_id),
+        reply = self.link.txrx(0x01, 0x31, struct.pack("<BI", int(parts[0]), request_id),
                                timeout_s=self.timeout)
         if reply is not None:
             self._show_uvc_capture_reply(reply, int(parts[0]), request_id)
@@ -607,17 +593,16 @@ class BeeDalRepl(cmd.Cmd):
             print(f"    path=/home/bee/data/images/usb/USB{camera-1}_{request_id:08d}.jpg")
 
     def do_dat_lst(self, arg):
-        "dat_lst [mark] -- Get logs/images/data file counts. TYPE=0x03 ADDR=0x00"
+        "dat_lst <mark> -- Get HK/SCI1/SCI2 file counts. TYPE=0x03 ADDR=0x00"
+        try:
+            mark_filt = int(arg.strip(), 0)
+            if not 0 <= mark_filt <= 255:
+                raise ValueError
+        except ValueError:
+            print("usage: dat_lst <mark>  (0-254, or 0xFF for all)")
+            return
+        tc_payload = struct.pack(protocol.DAT_LST_TC_FMT, mark_filt)
         self.selection = None
-        arg = arg.strip()
-        tc_payload = b""
-        if arg:
-            try:
-                mark_filt = int(arg, 0)
-            except ValueError:
-                print("usage: dat_lst [mark]  (0-254, or 0xFF/omit for all)")
-                return
-            tc_payload = struct.pack(protocol.DAT_LST_TC_FMT, mark_filt)
         payload = self.link.txrx(0x03, 0x00, tc_payload, timeout_s=self.timeout)
         if payload is None:
             return
@@ -630,7 +615,7 @@ class BeeDalRepl(cmd.Cmd):
             print(f"    {name:12s} = {val}")
 
     def do_dat_sel(self, arg):
-        "dat_sel <type 0=logs|1=images|2=data> <index> <chunk_size> -- Select a file. TYPE=0x03 ADDR=0x01"
+        "dat_sel <type 0=housekeeping|1=images|2=logs> <index> <chunk_size> -- Select a file. TYPE=0x03 ADDR=0x01"
         parts = arg.split()
         if len(parts) != 3:
             print("usage: dat_sel <data_type 0|1|2> <index> <chunk_size>")
@@ -641,6 +626,9 @@ class BeeDalRepl(cmd.Cmd):
             print("[!] arguments must be integers")
             return
 
+        if not (0 <= data_type <= 2 and 0 <= index <= 0xFFFFFFFF and 1 <= chunk_size <= 32768):
+            print("[!] type 0..2, index 0..4294967295, chunk_size 1..32768 required")
+            return
         payload = struct.pack(protocol.DAT_SEL_TC_FMT, data_type, index, chunk_size)
         resp = self.link.txrx(0x03, 0x01, payload, timeout_s=self.timeout)
         self.selection = None
@@ -677,6 +665,9 @@ class BeeDalRepl(cmd.Cmd):
             chunk_index = int(parts[0], 0)
         except ValueError:
             print("[!] chunk_index must be an integer")
+            return
+        if not 0 <= chunk_index <= 0xFFFFFFFF:
+            print("[!] chunk index must be 0..4294967295")
             return
         payload = struct.pack(protocol.DAT_GET_TC_FMT, chunk_index)
         resp = self.link.txrx(0x03, 0x02, payload, timeout_s=self.timeout)
@@ -725,7 +716,7 @@ class BeeDalRepl(cmd.Cmd):
         self.selection = None
 
     def do_dat_del(self, arg):
-        "dat_del <type 0=logs|1=images|2=data> <index> -- Delete one file. TYPE=0x03 ADDR=0x04"
+        "dat_del <type 0=housekeeping|1=images|2=logs> <index> -- Delete one file. TYPE=0x03 ADDR=0x04"
         parts = arg.split()
         if len(parts) != 2:
             print("usage: dat_del <data_type 0|1|2> <index>")
@@ -736,6 +727,9 @@ class BeeDalRepl(cmd.Cmd):
             print("[!] arguments must be integers")
             return
 
+        if not (0 <= data_type <= 2 and 0 <= index <= 0xFFFFFFFF):
+            print("[!] type 0..2 and index 0..4294967295 required")
+            return
         payload = struct.pack(protocol.DAT_DEL_TC_FMT, data_type, index)
         resp = self.link.txrx(0x03, 0x04, payload, timeout_s=self.timeout)
         self.selection = None
@@ -749,6 +743,10 @@ class BeeDalRepl(cmd.Cmd):
         for name, val in zip(protocol.DAT_LST_FIELDS, counts):
             print(f"    {name:12s} = {val}")
 
+    def do_dat_mrk(self, arg):
+        "dat_mrk <mark 0-254> -- ICD name for dat_mark"
+        return self.do_dat_mark(arg)
+
     def do_dat_mark(self, arg):
         "dat_mark <mark 0-254> -- Tag the file selected by dat_sel. TYPE=0x03 ADDR=0x05"
         parts = arg.split()
@@ -760,14 +758,14 @@ class BeeDalRepl(cmd.Cmd):
         except ValueError:
             print("[!] mark must be an integer")
             return
-        if mark == protocol.DAT_MARK_RESERVED:
+        if not 0 <= mark < protocol.DAT_MARK_RESERVED:
             print(f"[!] mark {protocol.DAT_MARK_RESERVED:#04x} is reserved (means 'no filter')")
             return
 
         payload = struct.pack(protocol.DAT_MARK_TC_FMT, mark)
         resp = self.link.txrx(0x03, 0x05, payload, timeout_s=self.timeout)
-        if resp is not None and len(resp) >= 4:
-            (uptime,) = struct.unpack(protocol.PING_TM_FMT, resp[:4])
+        if resp is not None and len(resp) == 4:
+            (uptime,) = struct.unpack(protocol.PING_TM_FMT, resp)
             print(f"    marked = {mark}  (uptime = {uptime} s)")
 
     def do_shell(self, arg):

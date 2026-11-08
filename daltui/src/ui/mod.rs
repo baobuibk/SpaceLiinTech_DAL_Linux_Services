@@ -395,8 +395,10 @@ fn draw_number_editor(f: &mut Frame, area: Rect, id: &str, value: &str, replace:
     let Some(control) = crate::app::control_by_id(id) else {
         return;
     };
-    let crate::controls::Kind::Step { min, max, unit, .. } = control.kind else {
-        return;
+    let (min, max, unit) = match control.kind {
+        crate::controls::Kind::Step { min, max, unit, .. } => (min as i64, max as i64, unit),
+        crate::controls::Kind::Unsigned => (0, u32::MAX as i64, ""),
+        _ => return,
     };
     let w = 52.min(area.width);
     let h = 7.min(area.height);
@@ -936,6 +938,45 @@ mod camera_layout_tests {
                 Color::White
             ]
         );
+    }
+
+    #[test]
+    fn both_point_results_fit_with_wrapped_saved_filenames() {
+        let mut st = State::new();
+        st.tab = Tab::Exp;
+        st.page[Sub::Exp.idx()] = 8;
+        for camera in 0..2 {
+            let c = &mut st.sim.exp.camera[camera];
+            c.object_id = 123;
+            c.saved_file = Some(format!(
+                "images/exp/EXP_C{camera}_B12345678_O12345678_E2_long.bin"
+            ));
+            c.point_coords = Some((10, 10, 2));
+            c.temp_centi = Some(2500);
+            c.point_max_centi = Some(2600);
+            c.mean_centi = Some(2550);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(120, 46)).unwrap();
+        terminal.draw(|f| draw(f, &mut st)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..46)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        for label in [
+            "Point (x,y,d)",
+            "Point center",
+            "Point max / avg",
+            "Measure temperature",
+        ] {
+            assert_eq!(text.matches(label).count(), 2, "missing {label}\n{text}");
+        }
+        assert!(text.contains("IMAGE TRANSFER"));
+        assert!(text.contains("Folder: images/exp"));
     }
 
     #[test]

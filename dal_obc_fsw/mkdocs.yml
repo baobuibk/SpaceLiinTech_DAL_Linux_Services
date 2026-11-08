@@ -19,9 +19,15 @@ nav:
       - Deployment: deployment.md
   - DALTUI:
       - Run on host, OBC, and RS-422: daltui-running.md
+      - Windows terminal and EXE build: daltui-windows.md
+      - Thu thập file OBC — DALTUI và command: obc-file-collection.md
   - ICD and hardware:
+      - icd1.2: icd1.2.md
+      - ICD v1.2 payload contracts: icd-v1p2-payload-contracts.md
+      - ICD v1.0 to v1.2 changes and TODO: icd-revision-changes.md
       - BEE-DAL ICD revision 1.0: icd.md
       - ICD and console mapping: icd-console-mapping.md
+      - ICD v1.2 and console command mapping: icd-v1p2-console-mapping.md
       - MPU and FPGA guide: DAL_OBC_V110_MPU_FPGA_Design_and_Programming.md
       - RS-422 service review: RS422_Service_Review.md
 

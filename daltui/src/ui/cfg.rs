@@ -294,7 +294,7 @@ fn draw_sources(f: &mut Frame, st: &State, area: Rect) {
         ("OBC temps, BME, PAC", "tm_obc_get 04/02 (64 B)"),
         ("OBC/EXP/PDU switches", "pwr_stat 01/04, pwr_en 01/03"),
         ("PDU VOUT, TRANS, inputs", "pwr_stat PDU, pdu_vout 01/02"),
-        ("PDU temp, mode", "gui_state (console only)"),
+        ("PDU temp, mode, TPS", "pwr_stat 01/04 (binary)"),
         ("Board online, versions", "sys_info 01/00 (96 B)"),
         ("Heaters, IR", "thm_stat 01/15, exp_run 02/0C"),
         ("Pumps U11/U15", "fld_stat 01/18, exp_run pump*"),

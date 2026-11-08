@@ -60,11 +60,11 @@ class Thp(FswTestCase):
         return json.loads(self.fsw.console.run("--json", *cmd))
 
     def tx(self, payload, **kw):
-        return self.link.txrx(2, THP, payload, **kw)
+        return self.link.txrx(2, 0x10 if len(payload) == 32 and payload[0] == 0 else THP, payload, **kw)
 
     # -- wire level ----------------------------------------------------------------
     def test_thp_01_heater_get_returns_the_live_record(self):
-        p = self.tx(get(0, 2)).expect_ack(2, THP, 32)
+        p = self.tx(get(0, 2)).expect_ack(2, 0x10, 32)
         self.assertEqual(p[0:3], bytes((0, 0, 2)))
         self.assertEqual(struct.unpack_from("<hhhH", p, 5), (3000, 500, 8000, 5000))
         self.assertEqual(struct.unpack_from("<fff", p, 16), (1.5, 0.25, 0.0))
@@ -75,7 +75,7 @@ class Thp(FswTestCase):
                          timeout=8000, resume=1, up=20, down=30, kp=2.0, ki=0.5, kd=0.125)
         self.assertEqual(self.tx(req).expect_ack(2, THP, 32), req)
         self.assertEqual(self.sent(), ["thp_wire_cfg " + req.hex()])
-        again = self.tx(get(0, 3)).expect_ack(2, THP, 32)
+        again = self.tx(get(0, 3)).expect_ack(2, 0x10, 32)
         self.assertEqual(again[3:], req[3:])                       # persisted in the model
         self.assertEqual(self.tx(get(0, 0)).payload[5:7], struct.pack("<h", 3000))  # others untouched
 
@@ -99,8 +99,8 @@ class Thp(FswTestCase):
                 self.tx(payload).expect_err(1)
         self.assertEqual(self.fsw.exp.commands[before:], [])       # none reached the EXP
 
-    def test_thp_05_length_must_be_32(self):
-        for n in (0, 1, 3, 31, 33, 64):
+    def test_thp_05_length_must_be_zero_or_32(self):
+        for n in (1, 3, 31, 33, 64):
             self.tx(bytes(n)).expect_err(0)
 
     def test_thp_06_exp_refusal_is_a_data_error(self):
@@ -306,8 +306,8 @@ class ThpCtl(FswTestCase):
                 self.ctl(bytes((b,))).expect_err(0x01)
         self.assertEqual(self.sent(), [])
 
-    def test_thp_28_length_must_be_one(self):
-        for n in (0, 2, 4):
+    def test_thp_28_length_must_be_zero_or_one(self):
+        for n in (2, 4):
             with self.subTest(n):
                 self.ctl(bytes(n)).expect_err(0x00)
         self.assertEqual(self.sent(), [])

@@ -44,9 +44,9 @@ class Framing(FswTestCase):
         self.link.expect_silence(1.0, "frame with CRC over header")
         self.link.txrx(0, 0).expect_ack(0, 0)
 
-    def test_frm_05_max_length_payload_accepted(self):
+    def test_frm_05_max_length_decoded_then_command_length_rejected(self):
         tm = self.link.txrx(0, 0, bytes(range(256)) * (bdal.MAX_PAYLOAD // 256), timeout=30)
-        tm.expect_ack(0, 0, length=4)
+        tm.expect_err(0)
 
     def test_frm_06_over_max_length_resets_decoder(self):
         self.link.write(bytes((0xA5, 0x00, 0x00)) + struct.pack("<H", bdal.MAX_PAYLOAD + 1))
@@ -81,11 +81,11 @@ class Framing(FswTestCase):
         self.link.write(head)
         time.sleep(SHORT_GAP)
         self.link.write(tail)
-        self.link.read_tm().expect_ack(0, 0)
+        self.link.read_tm().expect_err(0)
 
     def test_frm_11_start_byte_inside_payload(self):
         tm = self.link.txrx(0, 0, bytes.fromhex("A5 A5 00 00 A5 A5"))
-        tm.expect_ack(0, 0, length=4)
+        tm.expect_err(0)
         self.link.expect_silence(0.3, "mis-framed payload")
 
     def test_frm_12_every_reply_is_well_formed(self):

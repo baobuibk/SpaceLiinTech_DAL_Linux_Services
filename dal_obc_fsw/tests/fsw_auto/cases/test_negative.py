@@ -54,7 +54,7 @@ class Negative(FswTestCase):
         # handlers (slow timeouts on silent fakes) and the debug range.
         skip = {(0x01, 0x01), (0x03, 0x04), (0x01, 0x00), (0x01, 0x02)} | \
                {k for k in IMPLEMENTED if k[0] in (0x02, 0xFF) or k in
-                {(0x01, a) for a in (0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x1A, 0x1B)}}
+                {(0x01, a) for a in (0x05, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x1A, 0x1B)}}
         for i in range(count):
             type_, addr = rng.choice([0, 1, 3, 4, 5, 6, 0x80]), rng.randrange(256)
             if (type_, addr) in skip or type_ == 0xFF:

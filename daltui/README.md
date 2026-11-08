@@ -62,7 +62,7 @@ OBC and EXP tabs have several pages, switched with `<` / `>` (or `,` / `.`). The
 | --- | --- |
 | HOME | **Housekeeping** strip (Update Housekeeping AUTO / MANUAL and the UPDATE button), then three cards (OBC, EXP, PDU) with health badge and key telemetry |
 | OBC | **Overview**: system, devices, temperatures, 8 PAC1934 rails; eFuses, editable UTC Set Time, reboot. **Camera**: USB controls and JPEG capture on the left; CAMERA_LED PWM, four USB power switches, and camera selection. MIPI controls and PNG capture on the right; two boards, four sensors each, route and power actions. The original RAW is retained. Capture status and saved paths appear below the controls. |
-| EXP | **Overview**: rails, heaters, IR, burn wire, MCU reset. **Pump U11** (single pump): set/read type, detect, init, frequency, voltage, enable. **Pump U15** (four-channel): detect, init, channel, shared frequency, per-channel voltage, enable. **Motors**: MOTOR rail, DRV8910, per-motor mode, max speed, PWM, optical MIN/MAX mapping and polarity; separate MANUAL and OPERATION command panels. **IR LEDs**: output status and limits, select channel, stage duty and PWM limits, queue configuration, read status, on/off. **Burn wire**: runtime and both wire status cards, separate controls per wire, Set config, Read status, and a timed Burn request confirmation. **Crystallization**: PC status and log location, valve/flow/route mapping, profile fields, Test/Replace/Circulation/ground operations, and manual V1–V4/U11 controls. **Heaters**: manual limits/duty, PID profile configuration, auto start/stop/resume and profile status. **IR Camera**: configure either EXP MLX9064x camera, enable its I2C buffer, detect/init/capture, inspect the PSRAM object ID, automatically display the full-frame maximum and its coordinates after capture, and measure maximum or average temperature around a selected center. |
+| EXP | **Overview**: rails, heaters, IR, burn wire, MCU reset. **Pump U11** (single pump): set/read type, detect, init, frequency, voltage, enable. **Pump U15** (four-channel): detect, init, channel, shared frequency, per-channel voltage, enable. **Motors**: MOTOR rail, DRV8910, per-motor mode, max speed, PWM, optical MIN/MAX mapping and polarity; separate MANUAL and OPERATION command panels. **IR LEDs**: output status and limits, select channel, stage duty and PWM limits, queue configuration, read status, on/off. **Burn wire**: runtime and both wire status cards, separate controls per wire, Set config, Read status, and a timed Burn request confirmation. **Crystallization**: PC status and log location, valve/flow/route mapping, profile fields, Test/Replace/Circulation/ground operations, and manual V1–V4/U11 controls. **Heaters**: manual limits/duty, PID profile configuration, auto start/stop/resume and profile status. **IR Camera**: configure either EXP MLX9064x camera, enable its I2C buffer, detect/init/capture, inspect the PSRAM object ID, automatically display the full-frame maximum and its coordinates after capture, and request fresh point/window temperatures using center X/Y and delta. |
 | PDU | Mode, flags, VOUT/+12/+5_TRANS/+5 rails, faults, events; VOUT/TRANS enable, setpoint, mode, fault clear, temperature limit, heartbeat LED, bootloader |
 | LOG | Every command, refusal and fault, newest last |
 
@@ -197,7 +197,7 @@ only queues jobs and drains results, so a slow EXP command never blocks the keys
 | --- | --- |
 | OBC onboard temp, NTC1-4, BME688, PAC U6/U2 | `tm_obc_get` 04/02 |
 | OBC eFuse, USB, MIPI switches; set | `pwr_stat OBC` 01/04; `pwr_en OBC <out> on\|off` 01/03 |
-| EXP rails, heaters, IR | `pwr_stat EXP`, `pwr_en EXP`; `thm_stat` 01/15, `exp_run heater_set` / `ir_set` 02/0C |
+| EXP rails, heaters, IR | `pwr_stat all`, `pwr_en EXP`; `thm_stat` 01/15, `exp_run heater_set` / `ir_set` 02/0C |
 | Pumps U11/U15 | `fld_stat` 01/18; `fld_ctl pump` 01/17; `fld_cfg pump detect`/`pump_type` 01/16; `exp_run pump_init` |
 | PC crystallization | `pc_stat` 02/00; `pc_cfg` 02/01 for valve/flow/routes/profile/datalog; `pc_ctl` 02/02 for operations; `exp_run pc_status` / `pc_profile_show` 02/0C for details |
 | DRV8910, motors | `rba_stat` 01/1B; `rba_ctl init\|home\|stop\|stop_hold` 01/1A; `exp_run motor5_mode_set`, `motor5_run`, `motor5_move`, `motor5_cfg_set`, `motor5_pwm_freq_set`, `motor5_limits_set`, `limit_cfg_set` 02/0C |
@@ -207,13 +207,15 @@ only queues jobs and drains results, so a slow EXP command never blocks the keys
 | PDU temperature, mode | `gui_state` (console only) |
 | Board online, versions | `sys_info` 01/00 |
 | USB camera capture | `uvc_ctl` 01/11, `uvc_stat` 01/12 |
-| EXP IR camera | `exp_run camera_config`, `camera_buffer_enable/disable`, `camera_detect`, `camera_init`, `camera_capture`, `camera_status`, `camera_temp` 02/0C |
+| EXP IR camera | `exp_run camera_config`, `camera_buffer_enable/disable`, `camera_detect`, `camera_init`, `camera_capture`, `camera_status`, `camera_point` 02/0C |
 
 The EXP IR Camera page uses the MCU's 32×24 thermal sensor frame. Enable the selected I2C buffer,
 detect and initialize the sensor, then capture. The capture action polls `camera_status` until
-the MCU reports a final result and shows its PSRAM object ID. Set X/Y/width/height within
-32×24 and choose **Measure max temp** to read the hottest pixel in that region from the
-last completed frame. Temperature is displayed in °C; the MCU sends centi-°C.
+the MCU reports a final result and shows its PSRAM object ID. Set **Center X**, **Center Y**
+and **Delta**, then choose **Measure temperature**. This queues `camera_point` and reads
+a fresh frame in SRAM without requiring a saved capture. Results include the center
+pixel and maximum/mean of the inclusive, edge-clipped square. Delta 0 is one pixel.
+Temperature is displayed in °C; the MCU sends centi-°C.
 An object ID identifies image data held on the EXP MCU. Flight software downloads it to
 `images/exp` under `DAL_EXP_DATA_DIR` after a table-6 notification and CRC verification;
 the object ID alone is not a Linux image path.
@@ -320,3 +322,122 @@ The countdown uses monotonic wall time, including while simulation is paused.
 Timeout and cancellation close the dialog and send the internal abort/disarm
 command. Neither can fire. Navigation cannot change wire or page while the
 dialog is open. The Overview Burn request shortcut uses the same dialog.
+
+### EXP automatic IR temperature monitor
+
+With EXP firmware build 456 or later, use **Start monitor temp** and
+**Stop monitor temp** for each camera in EXP > IR Camera. Monitoring defaults to
+OFF after boot, configuration and Initialize. When started, EXP's Camera worker
+samples that initialized camera on a 10-second target cadence independently of DALTUI.
+Stop prevents new samples and cancels the active monitor read at the next I2C/conversion boundary (`stopping...`, then `stopped`); it preserves the last successful temperatures. Capture image can queue behind an in-progress monitor read; the
+monitor no longer causes an immediate BUSY refusal. Capture and point requests run
+before the next periodic sample, so monitoring can remain enabled. The last measured values remain visible.
+Monitoring uses internal RAM and does not publish/store an image in PSRAM.
+Existing branch-enable/address rules apply: enable both branches only with
+verified distinct sensor addresses. Configure and Initialize each camera first.
+
+Run DALTUI with `--poll` to retrieve `camera_status 0/1` each housekeeping round.
+EXP > IR Camera shows `Auto monitor`, `Max temperature`, `Max position`, and `Average temp`.
+Whole-frame statistics follow the latest acquisition; point/window results and saved image IDs are displayed separately.
+The last successful temperatures stay visible regardless of age. Status reports
+initialization, disabled I2C buffer, sensor restart, or read errors directly;
+there is no STALE state. Before the first successful sample temperatures are n/a.
+`--manual` retrieves the same cached values on UPDATE or Read status.
+Use a terminal at least 120 columns by 46 rows for all camera/transfer rows.
+The sampling cadence can slip during manual work or sensor timeouts.
+
+### Reset EXP MCU
+
+EXP > Overview > **Reset EXP MCU [!]** uses the normal Y confirmation and sends
+`exp_run reset` over either Console or RS-422. Install the updated OBC FSW as well
+as DALTUI: FSW handles this no-prompt command without a false UART timeout.
+The result means the command was sent, not that reboot has been confirmed.
+Read EXP status after startup. The existing EXP firmware reset command is used;
+no firmware reflash is needed for this UI/gateway fix.
+
+### Native ICD v1.2 sensor configuration
+
+EXP → Sensors reads effective BME688 and LSM6DSOX configuration through `01/05`.
+GET has no payload and returns both sensors in eight packed bytes. Draft edits
+stay local; each Set command submits only one sensor/parameter group and updates
+status from verified FSW readback. Read BME/IMU status uses `01/06` with a one-byte
+selector. Use a matching FSW build; older FSW does not implement these endpoints.
+See `../dal_obc_fsw/docs/icd-v1p2-console-mapping.md` for exact layouts and limits.
+
+Native ICD v1.2 power/thermal update: power polling now sends one aggregate
+`pwr_stat all` request (one-byte TC, at most 168-byte TM). Thermal status
+requires eight payload bytes, including two reserved zero bytes. Update the OBC
+FSW and DALTUI on OBC/Pi together; the older power board/mask request is rejected.
+
+
+### OBC → Data transfer (ICD v1.2)
+
+Use List files → Select file → Download file → optional Mark selected → Deselect file.
+The status panel shows OBC counts and selected metadata, transfer progress, CRC32 and local filename.
+Read next chunk transfers one sequential chunk; Pause download stops after the pending chunk.
+Download resumes until completion. Delete selected file requires explicit confirmation and never runs automatically.
+
+`dat_sel` now sends seven bytes (U8 type, U32 index, U16 chunk size); update OBC FSW with DALTUI.
+Chunks are 1–32768 bytes. Empty files have zero chunks. Downloads stream to `./downloads`
+on the client machine, or `$DAL_TUI_DOWNLOAD_DIR`; partial files retain `.part` and final
+files are published only after size/CRC32 verification. After an error or reconnect, list/select again.
+Only one file-transfer client may use the OBC selection at a time. Simulation does not download files.
+
+File categories: HK (0) = housekeeping only; SCI1 (1) = images; SCI2 (2) = LWL and PC logs. Source folders remain unchanged; re-list after updating FSW.
+
+
+### Windows x64 terminal client
+
+Prebuilt package: `target/windows-x64/daltui-windows-x64.zip`.
+Extract it and open PowerShell in the extracted folder:
+
+```powershell
+.\daltui.exe --sim
+.\daltui.exe --rs422 COM3 --baud 921600 --poll
+```
+
+Use the actual USB-RS422 COM port (including COM10+). No `TERM` variable is needed.
+Windows supports simulation and physical COM serial, not Linux console/frame sockets.
+Local-console-only controls remain unavailable over RS-422.
+
+Build from Linux with Rust, MinGW-w64 x64 GCC/binutils, and Python 3:
+
+```sh
+tools/build-windows.sh
+# Or from Linux_DAL: make -C service daltui-windows
+# Custom compiler: WINDOWS_CC=/path/to/x86_64-w64-mingw32-gcc tools/build-windows.sh
+```
+
+Build natively from PowerShell with Rust + MSVC C++ Build Tools/Windows SDK:
+
+```powershell
+.\tools\build-windows.ps1
+```
+
+Both scripts package EXE/README/SHA256SUMS under `target/windows-x64/`.
+The Windows dependency is target-specific; the Linux transport is retained.
+For downloads, set `$env:DAL_TUI_DOWNLOAD_DIR` to a writable local NTFS folder;
+otherwise files go to `.\downloads`. Existing CRC-verified publication uses hard links.
+See [Windows setup and build guide](../dal_obc_fsw/docs/daltui-windows.md).
+The Windows GNU build is cross-compiled; physical Windows adapter testing remains required.
+
+PDU status: `pwr_stat` uses schema/report 0x0200|report, K source records and a 16-byte PDU trailer (184 bytes for all). TRANS OFF shows TPS NOT POWERED; invalid values show N/A. Temperature/mode/TPS now update over physical RS-422 too. Update FSW and clients together.
+
+## ICD v1.2 payload alignment
+
+Use this build with the matching OBC flight-software deploy package. Native ICD
+commands retain the PDF lengths and uptime ACKs. DALTUI uses separate DAL
+extensions for selected profile GETs, board power masks and detailed motor,
+pump and capture jobs; these extensions no longer overload native ICD addresses.
+See the [payload contracts](../dal_obc_fsw/docs/icd-v1p2-payload-contracts.md).
+
+### Fresh EXP point/window temperature
+
+Use the matching EXP firmware with `camera_point` support and this DALTUI build.
+In EXP > IR Camera, initialize the sensor, edit X/Y/Delta and run **Measure temperature**.
+The status card shows **Point (x,y,d)**, **Point center**, and **Point max / avg**.
+The command is asynchronous; DALTUI polls `camera_status` even in control-only mode.
+The window clips to x=0..31 and y=0..23. Changing draft coordinates preserves the
+previous result and its measured coordinates until a new request completes.
+The former separate Measure max/Measure average actions and width/height ROI CLI
+are removed. Whole-frame statistics and retained image IDs remain separate from point results.

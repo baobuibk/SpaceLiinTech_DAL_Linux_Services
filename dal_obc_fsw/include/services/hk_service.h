@@ -27,7 +27,7 @@ typedef struct {
     int16_t  slf_flow_rate;   
     uint16_t rba_status;      
     uint16_t ta_status;       
-    /* OBC acquisition cache. The legacy 29-byte tm_get remains unchanged. */
+    /* OBC acquisition cache. tm_get uses a separate ICD v1.2 encoder. */
     bool obc_snapshot_valid;
     uint32_t obc_sample_epoch;
     uint32_t temp_sample_epoch;

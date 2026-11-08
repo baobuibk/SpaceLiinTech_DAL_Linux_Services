@@ -104,6 +104,15 @@ static uint8_t request_locked(int fd, const char *command, char *out,
         if (n > 0) written += (size_t)n;
         else if (n < 0 && errno != EAGAIN && errno != EINTR) return 1;
     }
+    /* The MCU reset command does not return a CLI prompt. Drain transmission
+     * before closing the UART, but do not claim that the reboot completed. */
+    if (strcmp(command, "reset") == 0) {
+        int drained;
+        do { drained = ioctl(fd, TCSBRK, 1); } while (drained < 0 && errno == EINTR);
+        if (drained < 0) return 1;
+        snprintf(out, cap, "EXP reset command sent; reboot not confirmed");
+        return 0;
+    }
     while (milliseconds() < deadline) {
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
         int ready = poll(&pfd, 1, 100);
@@ -204,6 +213,11 @@ static uint8_t command_timeout(const char *command, char *output,
 uint8_t exp_uart_command(const char *command, char *output, size_t capacity)
 {
     return command_timeout(command, output, capacity, 15000);
+}
+
+uint8_t exp_uart_sensor_command(const char *command, char *output, size_t capacity)
+{
+    return command_timeout(command, output, capacity, 2000);
 }
 
 uint8_t exp_uart_param_show(unsigned table, char *output, size_t capacity)

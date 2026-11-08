@@ -8,6 +8,9 @@ description = "Terminal UI for the DAL OBC, EXP and PDU subsystems (simulation f
 ratatui   = "0.29"
 crossterm = "0.28"
 
+[target.'cfg(windows)'.dependencies]
+serialport = { version = "4.10.1", default-features = false }
+
 [profile.release]
 opt-level = "z"
 lto = true

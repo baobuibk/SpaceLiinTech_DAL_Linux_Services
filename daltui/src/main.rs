@@ -1,5 +1,6 @@
 mod app;
 mod controls;
+mod data_transfer;
 mod json;
 mod link;
 mod live;
@@ -31,7 +32,9 @@ SOURCE (default: console when its socket exists, otherwise sim)
                      or /run/dal/dal_obc_fsw/console.sock)
   --rs422 [PATH]     binary RS-422 frames, for protocol checks. PATH is the flight frame
                      socket ($DAL_OBC_RS422_SOCKET, /run/dal/dal_obc_fsw/rs422.sock)
-                     or a serial device such as /dev/ttyUSB0 (--baud, default 921600)
+                     or a serial device such as /dev/ttyUSB0 or COM3 (--baud, default 921600)
+                     Windows: COM ports only; default COM1 (override with --rs422 COMn).
+                     --console and --compare require Linux Unix sockets.
   The source can also be changed at run time on the CFG tab.
 
   --control-only     send only commands explicitly selected by the operator (default live mode)
@@ -129,6 +132,13 @@ fn parse_args() -> Opts {
 
 fn main() -> io::Result<()> {
     let o = parse_args();
+    #[cfg(windows)]
+    if o.compare || o.mode == Some(Mode::Console) {
+        eprintln!(
+            "--console/--compare require Linux Unix sockets; on Windows use --rs422 COM3 or --sim"
+        );
+        std::process::exit(2);
+    }
     if o.compare {
         std::process::exit(compare(&o.console, &o.rs422, o.baud));
     }
@@ -295,7 +305,7 @@ fn dump(mut st: State, args: &[String]) -> io::Result<()> {
 /// Returns the process exit code (0 = all payloads identical).
 fn compare(console: &str, rs422: &str, baud: u32) -> i32 {
     use link::{Console, Rs422, Transport};
-    use proto::{Board, Cmd};
+    use proto::Cmd;
     let mut con = Console {
         path: console.to_string(),
     };
@@ -306,9 +316,7 @@ fn compare(console: &str, rs422: &str, baud: u32) -> i32 {
         (proto::sys_info(), "epoch header"),
         (proto::sys_rtc_get(), "epoch"),
         (proto::tm_obc_get(), "epoch"),
-        (proto::pwr_stat(Board::Obc), "epoch, ages"),
-        (proto::pwr_stat(Board::Pdu), "epoch, ages"),
-        (proto::pwr_stat(Board::Exp), "epoch, ages"),
+        (proto::pwr_stat(), "availability flags"),
         (proto::pdu_vout_get(), ""),
         (proto::thm_stat(), ""),
         (proto::fld_stat(), ""),

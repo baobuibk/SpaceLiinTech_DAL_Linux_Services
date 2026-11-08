@@ -23,7 +23,7 @@ impl Sub {
     }
     pub fn pages(self) -> &'static [&'static str] {
         match self {
-            Sub::Obc => &["Overview", "Camera"],
+            Sub::Obc => &["Overview", "Camera", "Data transfer"],
             Sub::Exp => &[
                 "Overview",
                 "Pump U11",
@@ -34,6 +34,7 @@ impl Sub {
                 "Crystallization",
                 "Heaters",
                 "IR Camera",
+                "Sensors",
             ],
             Sub::Pdu => &["Overview"],
         }
@@ -41,7 +42,8 @@ impl Sub {
     pub fn controls(self, page: usize) -> &'static [Control] {
         match (self, page) {
             (Sub::Obc, 0) => OBC_MAIN,
-            (Sub::Obc, _) => OBC_CAM,
+            (Sub::Obc, 1) => OBC_CAM,
+            (Sub::Obc, _) => OBC_DATA,
             (Sub::Exp, 0) => EXP_MAIN,
             (Sub::Exp, 1) => EXP_U11,
             (Sub::Exp, 2) => EXP_U15,
@@ -50,13 +52,15 @@ impl Sub {
             (Sub::Exp, 5) => EXP_BURN,
             (Sub::Exp, 6) => EXP_PC,
             (Sub::Exp, 7) => EXP_HEATER,
-            (Sub::Exp, _) => EXP_CAMERA,
+            (Sub::Exp, 8) => EXP_CAMERA,
+            (Sub::Exp, _) => EXP_SENSORS,
             (Sub::Pdu, _) => PDU,
         }
     }
 }
 
 pub enum Kind {
+    Unsigned,
     Toggle,
     Step {
         min: i32,
@@ -247,7 +251,7 @@ pub static EXP_MAIN: &[Control] = &[
         "exp.reset",
         "Reset EXP MCU",
         Kind::Danger,
-        "Reboots the SAMV71. Rails return to their power-on state.",
+        "Send a software reset to the EXP SAMV71. Read status after startup to verify recovery.",
     ),
 ];
 
@@ -922,6 +926,14 @@ pub static EXP_CAMERA: &[Control] = &[
         "Load calibration and settings.",
     ),
     c(
+        "Camera operation", "exp.cam_monitor_start", "Start monitor temp",
+        Kind::Action, "Start RAM-only temperature sampling every 2 s; initialize first.",
+    ),
+    c(
+        "Camera operation", "exp.cam_monitor_stop", "Stop monitor temp",
+        Kind::Action, "Stop periodic sampling after the current read; retain the last temperature.",
+    ),
+    c(
         "Camera operation",
         "exp.cam_capture",
         "Capture image",
@@ -948,12 +960,8 @@ pub static EXP_CAMERA: &[Control] = &[
         step(0, 31, 1, "px"), "Expand from the center in each direction, clipped to image edges. Zero measures one pixel.",
     ),
     c(
-        "Point measurement", "exp.cam_temp", "Measure max", Kind::Action,
-        "Maximum in the clipped center +/- delta square of the latest completed capture.",
-    ),
-    c(
-        "Point measurement", "exp.cam_mean", "Measure average", Kind::Action,
-        "Arithmetic mean of all pixels in the clipped center +/- delta square. Uses the existing capture.",
+        "Point measurement", "exp.cam_temp", "Measure temperature", Kind::Action,
+        "Read a fresh frame in RAM and measure center, maximum and average in the clipped center +/- delta square. No image is saved.",
     ),
 ];
 
@@ -1766,4 +1774,184 @@ pub static EXP_HEATER: &[Control] = &[
         Kind::Action,
         "Resume selected heater profile after permitted interruption.",
     ),
+];
+
+pub const SENSOR_FIELDS: [&str; 12] = [
+    "exp.sensor_t_os",
+    "exp.sensor_p_os",
+    "exp.sensor_h_os",
+    "exp.sensor_filter",
+    "exp.sensor_accel_odr",
+    "exp.sensor_accel_scale",
+    "exp.sensor_gyro_odr",
+    "exp.sensor_gyro_scale",
+    "exp.sensor_ff_threshold",
+    "exp.sensor_ff_duration",
+    "exp.sensor_wu_threshold",
+    "exp.sensor_wu_duration",
+];
+pub fn sensor_field(id: &str) -> Option<usize> {
+    SENSOR_FIELDS.iter().position(|name| *name == id)
+}
+pub static EXP_SENSORS: &[Control] = &[
+    c(
+        "Sensor configuration",
+        "exp.sensor_get",
+        "Read both configs",
+        Kind::Action,
+        "Read effective BME and IMU configuration. Draft is unchanged.",
+    ),
+    c(
+        "BME config draft",
+        "exp.sensor_t_os",
+        "Temperature oversampling",
+        Kind::Choice(&["1x", "2x", "4x", "8x", "16x"]),
+        "Edit draft only; use the corresponding Set command to apply.",
+    ),
+    c(
+        "BME config draft",
+        "exp.sensor_p_os",
+        "Pressure oversampling",
+        Kind::Choice(&["1x", "2x", "4x", "8x", "16x"]),
+        "Edit draft only; use the corresponding Set command to apply.",
+    ),
+    c(
+        "BME config draft",
+        "exp.sensor_h_os",
+        "Humidity oversampling",
+        Kind::Choice(&["1x", "2x", "4x", "8x", "16x"]),
+        "Edit draft only; use the corresponding Set command to apply.",
+    ),
+    c(
+        "BME config draft",
+        "exp.sensor_filter",
+        "IIR filter",
+        Kind::Choice(&["off", "1", "3", "7", "15", "31", "63", "127"]),
+        "Edit draft only; use the corresponding Set command to apply.",
+    ),
+    c(
+        "BME config draft",
+        "exp.sensor_set_bme",
+        "Set bme config",
+        Kind::Action,
+        "Apply only this sensor configuration; wait for verified readback.",
+    ),
+    c(
+        "IMU config draft",
+        "exp.sensor_accel_odr",
+        "Accel ODR",
+        Kind::Choice(&[
+            "off", "12.5Hz", "26Hz", "52Hz", "104Hz", "208Hz", "416Hz", "833Hz",
+        ]),
+        "Edit draft only; use the corresponding Set command to apply.",
+    ),
+    c(
+        "IMU config draft",
+        "exp.sensor_accel_scale",
+        "Accel scale",
+        Kind::Choice(&["2g", "16g", "4g", "8g"]),
+        "Edit draft only; use the corresponding Set command to apply.",
+    ),
+    c(
+        "IMU config draft",
+        "exp.sensor_set_accel",
+        "Set accel config",
+        Kind::Action,
+        "Apply only this sensor configuration; wait for verified readback.",
+    ),
+    c(
+        "IMU config draft",
+        "exp.sensor_gyro_odr",
+        "Gyro ODR",
+        Kind::Choice(&[
+            "off", "12.5Hz", "26Hz", "52Hz", "104Hz", "208Hz", "416Hz", "833Hz",
+        ]),
+        "Edit draft only; use the corresponding Set command to apply.",
+    ),
+    c(
+        "IMU config draft",
+        "exp.sensor_gyro_scale",
+        "Gyro scale",
+        Kind::Choice(&["125dps", "250dps", "500dps", "1000dps", "2000dps"]),
+        "Edit draft only; use the corresponding Set command to apply.",
+    ),
+    c(
+        "IMU config draft",
+        "exp.sensor_set_gyro",
+        "Set gyro config",
+        Kind::Action,
+        "Apply only this sensor configuration; wait for verified readback.",
+    ),
+    c(
+        "IMU config draft",
+        "exp.sensor_ff_threshold",
+        "Free-fall threshold",
+        step(0, 7, 1, "reg"),
+        "Edit draft only; use the corresponding Set command to apply.",
+    ),
+    c(
+        "IMU config draft",
+        "exp.sensor_ff_duration",
+        "Free-fall duration",
+        step(0, 63, 1, "reg"),
+        "Edit draft only; use the corresponding Set command to apply.",
+    ),
+    c(
+        "IMU config draft",
+        "exp.sensor_set_freefall",
+        "Set freefall config",
+        Kind::Action,
+        "Apply only this sensor configuration; wait for verified readback.",
+    ),
+    c(
+        "IMU config draft",
+        "exp.sensor_wu_threshold",
+        "Wake-up threshold",
+        step(0, 63, 1, "reg"),
+        "Edit draft only; use the corresponding Set command to apply.",
+    ),
+    c(
+        "IMU config draft",
+        "exp.sensor_wu_duration",
+        "Wake-up duration",
+        step(0, 3, 1, "reg"),
+        "Edit draft only; use the corresponding Set command to apply.",
+    ),
+    c(
+        "IMU config draft",
+        "exp.sensor_set_wakeup",
+        "Set wakeup config",
+        Kind::Action,
+        "Apply only this sensor configuration; wait for verified readback.",
+    ),
+    c(
+        "Sensor measurements",
+        "exp.sensor_bme_read",
+        "Read BME status",
+        Kind::Action,
+        "Native ICD 01/06, report 2.",
+    ),
+    c(
+        "Sensor measurements",
+        "exp.sensor_imu_read",
+        "Read IMU status",
+        Kind::Action,
+        "Native ICD 01/06, report 3.",
+    ),
+];
+
+pub static OBC_DATA: &[Control] = &[
+    c("1. List", "obc.dat_filter", "Mark filter", step(0,255,1,""), "255 = all; 0 = unmarked; 1..254 = exact mark"),
+    c("1. List", "obc.dat_list", "List files", Kind::Action, "dat_lst: rebuild index; clears selection"),
+    c("2. Select", "obc.dat_type", "Data type", Kind::Choice(&["HK (housekeeping)","SCI1 (images)","SCI2 (LWL/PC logs)"]), "Select the file category"),
+    c("2. Select", "obc.dat_index", "File index", Kind::Unsigned, "Zero-based index within the listed category (U32)"),
+    c("2. Select", "obc.dat_chunk", "Chunk size", step(1,32768,1,"B"), "Maximum bytes per dat_get reply"),
+    c("2. Select", "obc.dat_select", "Select file", Kind::Action, "dat_sel: read filename, size, CRC32 and chunk count"),
+    c("3. Download", "obc.dat_read", "Read next chunk", Kind::Action, "dat_get: append one sequential chunk to local .part"),
+    c("3. Download", "obc.dat_download", "Download file", Kind::Action, "Read remaining chunks; save only after size and CRC32 verification"),
+    c("3. Download", "obc.dat_cancel", "Pause download", Kind::Action, "Stop after any pending chunk; Download resumes"),
+    c("4. Mark (optional)", "obc.dat_mark_value", "Mark value", step(0,254,1,""), "0 = unmarked; 1..254 = label; applies only on Mark selected"),
+    c("4. Mark (optional)", "obc.dat_mark", "Mark selected", Kind::Action, "dat_mrk: label the selected OBC file"),
+    c("5. Finish", "obc.dat_deselect", "Deselect file", Kind::Action, "dat_des: release selection; local file is retained"),
+    c("6. Delete (optional)", "obc.dat_delete", "Delete selected file", Kind::Danger, "Select and check the target first; deletes the selected file on OBC, then clears selection"),
 ];

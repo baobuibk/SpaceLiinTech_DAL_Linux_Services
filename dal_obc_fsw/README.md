@@ -37,16 +37,9 @@ accepts schema version 1 snapshots with `board="obc"`, `online=1`, and an
 `obc_timestamp` no older than 30 seconds. A transient read failure retains
 the last complete snapshot until it becomes stale. Before the first valid
 snapshot, or after staleness, the RS422 telemetry commands return the ICD
-data-error response. The old synthetic MLX, flow, RBA, and TA readings are
-not generated; their legacy `tm_get` fields remain zero.
+data-error response. `tm_get` now returns the ICD v1.2 57-byte payload (64-byte TM, CRC16 at offset 62), using cached PDU/EXP/OBC data. Invalid I16/U16 fields use 0x8000/0xFFFF. MLX average is unavailable until a verified full-frame average is published; no synthetic reading is generated. See docs/icd-v1p2-console-mapping.md for units and field mappings.
 
-The `dal` command reads the RAM snapshot. The local GUI requests telemetry
-through flight software's `gui_state` socket command.
-The RS422 `tm_get` response still has its original 29-byte layout, which
-contains only onboard and BME temperature, pressure, and humidity from this
-OBC set. A new telemetry-table entry, TYPE `0x04` / ADDRESS `0x02`, returns
-the full OBC snapshot. The ICD frame format and existing command responses
-are unchanged.
+`dal` and `tm_obc_get` (04/02) retain the separate OBC housekeeping snapshot interface.
 
 ### OBC housekeeping wire table (`0x04/0x02`)
 
@@ -220,7 +213,7 @@ list, `json on` or `json off` to switch format, and `exit` to quit. The commands
 `sys_info`, `sys_rtc [epoch|now]`, `pdu_vout get|set <mV>`,
 `pwr_en <OBC|EXP|PDU> get|<output> on|off [force for EXP off]`,
 `pwr_stat <OBC|EXP|PDU> get [source|all|mask <mask>]`, `tm_get`,
-`tm_obc_get`, `dat_lst [mark]`,
+`tm_obc_get`, `dat_lst <mark>`,
 `dat_sel <type> <index> <chunk_size>`, `dat_get <chunk>`, `dat_des`,
 `dat_del <type> <index>`, `dat_mark <mark>`, `shell <command>`, and
 `raw <type> <address> [byte ...]`. `debug_handoff yes` invokes the UART
@@ -240,13 +233,15 @@ this flag; the board service leaves it unset.
 `pdu_vout get` reads cached PDU VOUT setpoint, voltage, current, and status;
 `pdu_vout set <mV>` writes a target of 800–20000 mV to the PDU holding
 register `40001`. Both map to ICD `01/02` (`pwr_adj_cfg`). The set TC carries
-one U16 LE millivolt value (two payload bytes); the TM carries four U16 LE
+one U16 LE millivolt value plus six reserved zero bytes (eight payload bytes); the TM carries four U16 LE
 fields (eight bytes). PDU firmware powers TRANS before accessing its TPS55287
 regulator if TRANS was off. This command does not send a separate VOUT enable
 request. The [ICD mapping](../../docs/icd-console-mapping.md#pwr_adj_cfg-0x02)
 defines every field and the error behavior.
 
-The unified power command uses `01/03`, with a one-byte board ID:
+Native ICD `pwr_en` at `01/03` uses an empty GET or a two-byte masked SET and returns two bytes. See the [v1.2 payload definitions](docs/icd-v1p2-payload-contracts.md) for bit assignments and all native commands.
+
+The board-specific power extension uses `01/32`, with a one-byte board ID:
 `03` OBC, `04` EXP, or `05` PDU. For example, run `pwr_en OBC AI_power off`,
 `pwr_en EXP MOTOR on`, or `pwr_en PDU VOUT on`. `pwr_en <board> get` reads
 all control states on that board. For several outputs at once, use
@@ -298,7 +293,7 @@ At the `bee-dal>` prompt:
 ```text
 ping                         # ICD ping and uptime
 tm_obc_get                   # full OBC HK snapshot, TYPE 0x04 / ADDR 0x02
-tm_get                       # legacy 29-byte telemetry
+tm_get                       # ICD v1.2 57-byte payload telemetry
 exp_tlm sensors              # EXP UART schema-2 sensor JSON, TYPE 0x02 / ADDR 0x0B
 exp_run motor5_status all    # EXP UART CLI command, TYPE 0x02 / ADDR 0x0C
 shell uptime                 # debug extension: execute text on the OBC
@@ -309,3 +304,13 @@ raw 0x04 0x02                # send the OBC HK request without decoding fields
 The `shell` command is the firmware's `0xFF/0x01` debug extension; ordinary
 text bytes typed into a serial terminal are not ICD frames. The shell reply
 reports exit status and the command's combined stdout/stderr.
+
+### EXP software reset from DALTUI
+
+EXP > Overview > Reset EXP MCU sends `exp_run reset` through the existing EXP
+UART gateway. The command is transmitted once, with UART output drained before
+closing; FSW returns `EXP reset command sent; reboot not confirmed` because the
+MCU resets without returning its normal CLI prompt. This confirms transmission,
+not a completed reboot. Check EXP status after startup. No automatic reset retry
+is performed. This requires the updated FSW binary as well as updated DALTUI;
+the existing EXP firmware `reset` handler is used unchanged.

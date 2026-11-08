@@ -55,6 +55,7 @@ pub struct LogMsg {
 }
 
 pub enum Val {
+    Unsigned(u32),
     Bool(bool),
     Num(i32),
     Idx(usize),
@@ -256,6 +257,9 @@ impl Default for HeaterProfile {
 }
 
 pub struct Exp {
+    pub sensor_draft: [u8; 12],
+    pub sensor_actual: Option<([u8; 12], [bool; 2])>,
+    pub sensor_readings: [Option<Vec<Option<i16>>>; 2],
     pub link: bool,
     pub node: u8,
     pub uptime: f64,
@@ -382,6 +386,18 @@ pub struct Exp {
     pub faults: Vec<&'static str>,
 }
 
+#[derive(Clone, Debug)]
+pub struct CameraMonitor {
+    pub valid: bool,
+    pub error: i32,
+    pub sequence: u32,
+    pub max_centi: i32,
+    pub mean_centi: i32,
+    pub x: u8,
+    pub y: u8,
+}
+
+#[derive(Clone, Debug)]
 pub struct IrCamera {
     pub model: usize,
     pub address: i32,
@@ -400,7 +416,14 @@ pub struct IrCamera {
     pub result: String,
     pub temp_centi: Option<i32>,
     pub mean_centi: Option<i32>,
+    pub point_max_centi: Option<i32>,
+    pub point_coords: Option<(i32, i32, i32)>,
+    pub point_request_id: u32,
+    pub frame_mean_centi: Option<i32>,
     pub peak: Option<(i32, u8, u8)>,
+    pub monitor: Option<CameraMonitor>,
+    pub monitor_enabled: Option<bool>,
+    pub monitor_running: bool,
     pub sample_ms: u32,
     pub confirmed: bool,
     pub actual_model: usize,
@@ -447,7 +470,14 @@ impl Default for IrCamera {
             result: "not read".into(),
             temp_centi: None,
             mean_centi: None,
+            point_max_centi: None,
+            point_coords: None,
+            point_request_id: 0,
+            frame_mean_centi: None,
             peak: None,
+            monitor: None,
+            monitor_enabled: None,
+            monitor_running: false,
             sample_ms: 0,
             confirmed: false,
             actual_model: 0,
@@ -485,11 +515,14 @@ mod ir_camera_tests {
     }
 
     #[test]
-    fn capture_requires_init_and_measurement_requires_capture() {
+    fn point_measurement_requires_init_but_no_saved_image() {
         let mut s = Sim::new();
         s.run("exp.cam_capture");
         assert!(!s.exp.camera[0].data_exist);
         s.run("exp.cam_init");
+        s.run("exp.cam_temp");
+        assert_eq!(s.exp.camera[0].object_id, 0);
+        assert!(!s.exp.camera[0].data_exist);
         s.run("exp.cam_capture");
         assert_eq!(s.exp.camera[0].object_id, 1);
         s.run("exp.cam_temp");
@@ -501,6 +534,8 @@ mod ir_camera_tests {
 }
 
 pub struct Pdu {
+    pub status: Option<crate::proto::PduStatus>,
+    pub power_valid: [[bool; 2]; 4],
     pub online: bool,
     pub vout_en: bool,
     pub trans_en: bool,
@@ -525,6 +560,7 @@ pub struct Pdu {
 }
 
 pub struct Sim {
+    pub transfer: crate::data_transfer::Transfer,
     pub t: f64,
     pub paused: bool,
     pub inject: [bool; 3],
@@ -591,6 +627,9 @@ impl Sim {
             snapshot_age: 0.0,
         };
         let exp = Exp {
+            sensor_draft: [2, 3, 1, 2, 5, 3, 5, 3, 0, 0, 0, 0],
+            sensor_actual: None,
+            sensor_readings: [None, None],
             link: true,
             node: 11,
             uptime: 1_800.0,
@@ -785,6 +824,8 @@ impl Sim {
             faults: Vec::new(),
         };
         let pdu = Pdu {
+            status: None,
+            power_valid: [[true; 2]; 4],
             online: true,
             vout_en: false,
             trans_en: false,
@@ -818,6 +859,7 @@ impl Sim {
             &default_target(Mode::Rs422),
         );
         let mut s = Sim {
+            transfer: crate::data_transfer::Transfer::default(),
             t: 0.0,
             paused: false,
             inject: [false; 3],
@@ -1264,6 +1306,25 @@ impl Sim {
     }
 
     pub fn value(&self, id: &str) -> Val {
+        match id {
+            "obc.dat_filter" => return Val::Num(self.transfer.filter),
+            "obc.dat_index" => return Val::Unsigned(self.transfer.index),
+            "obc.dat_chunk" => return Val::Num(self.transfer.chunk),
+            "obc.dat_mark_value" => return Val::Num(self.transfer.mark),
+            "obc.dat_type" => return Val::Idx(self.transfer.kind),
+            _ => {}
+        }
+        if let Some(i) = crate::controls::sensor_field(id) {
+            return if i < 8 {
+                Val::Idx(if i < 3 {
+                    self.exp.sensor_draft[i].saturating_sub(1) as usize
+                } else {
+                    self.exp.sensor_draft[i] as usize
+                })
+            } else {
+                Val::Num(self.exp.sensor_draft[i] as i32)
+            };
+        }
         if let Some((i, field)) = crate::controls::ir_field(id) {
             let c = self.exp.ir_setup[i];
             return match field {
@@ -1603,6 +1664,25 @@ impl Sim {
     }
 
     pub fn set_num(&mut self, id: &str, v: i32) {
+        match id {
+            "obc.dat_filter" => {
+                self.transfer.filter = v.clamp(0, 255);
+                return;
+            }
+            "obc.dat_chunk" => {
+                self.transfer.chunk = v.clamp(1, 32768);
+                return;
+            }
+            "obc.dat_mark_value" => {
+                self.transfer.mark = v.clamp(0, 254);
+                return;
+            }
+            _ => {}
+        }
+        if let Some(i) = crate::controls::sensor_field(id) {
+            self.exp.sensor_draft[i] = v.clamp(0, [5, 5, 5, 7, 7, 3, 7, 4, 7, 63, 63, 3][i]) as u8;
+            return;
+        }
         if self.live.mode != Mode::Sim && self.live_action(id, Act::Num(v)) {
             return;
         }
@@ -1638,8 +1718,6 @@ impl Sim {
                     "exp.cam_y" => c.y = v,
                     _ => c.delta = v,
                 }
-                c.temp_centi = None;
-                c.mean_centi = None;
                 return;
             }
             "exp.ht_duration" => return self.exp.ht_profile[self.exp.ht_sel].duration = v,
@@ -1717,6 +1795,15 @@ impl Sim {
     }
 
     pub fn set_idx(&mut self, id: &str, v: usize) {
+        if id == "obc.dat_type" {
+            self.transfer.kind = v.min(2);
+            return;
+        }
+        if let Some(i) = crate::controls::sensor_field(id) {
+            let v = if i < 3 { v + 1 } else { v };
+            self.exp.sensor_draft[i] = v.min([5, 5, 5, 7, 7, 3, 7, 4, 7, 63, 63, 3][i]) as u8;
+            return;
+        }
         if let Some(i) = pc_field_index(id) {
             self.stage_pc_field(i, v as i32);
             return;
@@ -1817,7 +1904,51 @@ impl Sim {
     }
 
     pub fn run(&mut self, id: &str) {
+        if id.starts_with("obc.dat_") && self.live.mode == Mode::Sim {
+            self.transfer.status = "Simulation: connect Console or RS-422 for file transfer".into();
+            self.log(
+                Sub::Obc,
+                Level::Info,
+                "File transfer requires a live connection",
+            );
+            return;
+        }
         if self.live.mode != Mode::Sim && self.live_action(id, Act::Run) {
+            return;
+        }
+        if id.starts_with("exp.sensor_") {
+            let (mut actual, mut valid) = self
+                .exp
+                .sensor_actual
+                .unwrap_or(([2, 3, 1, 2, 5, 3, 5, 3, 0, 0, 0, 0], [true, true]));
+            let range = match id {
+                "exp.sensor_set_bme" => Some(0..4),
+                "exp.sensor_set_accel" => Some(4..6),
+                "exp.sensor_set_gyro" => Some(6..8),
+                "exp.sensor_set_freefall" => Some(8..10),
+                "exp.sensor_set_wakeup" => Some(10..12),
+                _ => None,
+            };
+            if let Some(r) = range {
+                valid[if r.start < 4 { 0 } else { 1 }] = true;
+                actual[r.clone()].copy_from_slice(&self.exp.sensor_draft[r]);
+            }
+            self.exp.sensor_actual = Some((actual, valid));
+            if id == "exp.sensor_bme_read" {
+                self.exp.sensor_readings[0] = Some(vec![Some(2500), Some(10130), Some(4100)]);
+            }
+            if id == "exp.sensor_imu_read" {
+                self.exp.sensor_readings[1] = Some(vec![
+                    Some(2500),
+                    Some(0),
+                    Some(0),
+                    Some(1000),
+                    Some(0),
+                    Some(0),
+                    Some(0),
+                ]);
+            }
+            self.log(Sub::Exp, Level::Ok, "Sensor command completed (simulated)");
             return;
         }
         if let Some((i, field)) = crate::controls::ir_field(id) {
@@ -1936,8 +2067,27 @@ impl Sim {
             "exp.cam_init" => {
                 let i = self.exp.cam_sel;
                 self.exp.camera[i].initialized = true;
+                self.exp.camera[i].monitor_enabled = Some(false);
+                self.exp.camera[i].monitor_running = false;
                 self.exp.camera[i].result = "OK".into();
                 self.log(Sub::Exp, Level::Ok, format!("camera_init {i}: ready"));
+            }
+            "exp.cam_monitor_start" | "exp.cam_monitor_stop" => {
+                let i = self.exp.cam_sel;
+                let start = id.ends_with("_start");
+                if start && !self.exp.camera[i].initialized {
+                    return self.log(Sub::Exp, Level::Warn, "initialize sensor first");
+                }
+                self.exp.camera[i].monitor_enabled = Some(start);
+                self.exp.camera[i].monitor_running = false;
+                self.log(
+                    Sub::Exp,
+                    Level::Ok,
+                    format!(
+                        "camera monitor {i}: {}",
+                        if start { "started" } else { "stopped" }
+                    ),
+                );
             }
             "exp.cam_capture" => {
                 let i = self.exp.cam_sel;
@@ -1971,36 +2121,32 @@ impl Sim {
                     format!("camera_status {i}: {}", self.exp.camera[i].result),
                 );
             }
-            "exp.cam_temp" | "exp.cam_mean" => {
+            "exp.cam_temp" => {
                 let i = self.exp.cam_sel;
                 let c = &mut self.exp.camera[i];
-                let Some((x, y, w, h)) = c.point_region().filter(|_| c.data_exist) else {
+                let Some((x, y, w, h)) = c.point_region().filter(|_| c.initialized) else {
                     return self.log(
                         Sub::Exp,
                         Level::Warn,
-                        "Point measurement: capture a frame first",
+                        "Point measurement: initialize sensor first",
                     );
                 };
-                let mean = id == "exp.cam_mean";
-                let temperature = if mean {
-                    2400 + i as i32 * 100 + (2 * x + w - 1) * 2 + (2 * y + h - 1)
-                } else {
-                    2400 + i as i32 * 100 + (x + w - 1) * 4 + (y + h - 1) * 2
-                };
-                if mean {
-                    c.mean_centi = Some(temperature);
-                } else {
-                    c.temp_centi = Some(temperature);
-                }
+                c.request_id += 1;
+                c.point_request_id = c.request_id;
+                c.point_coords = Some((c.x, c.y, c.delta));
+                let base = 2400 + i as i32 * 100;
+                c.temp_centi = Some(base + c.x * 4 + c.y * 2);
+                c.point_max_centi = Some(base + (x + w - 1) * 4 + (y + h - 1) * 2);
+                c.mean_centi = Some(base + (2 * x + w - 1) * 2 + (2 * y + h - 1));
+                c.peak = Some((base + 170, 31, 23));
+                c.frame_mean_centi = Some(base + 85);
                 c.sample_ms = (self.t * 1000.0) as u32;
+                c.result = "OK".into();
+                let measured = c.temp_centi.unwrap();
                 self.log(
                     Sub::Exp,
                     Level::Ok,
-                    format!(
-                        "Point {}: {:.2} °C",
-                        if mean { "average" } else { "max" },
-                        temperature as f32 / 100.0
-                    ),
+                    format!("Point temperature: {:.2} C", measured as f32 / 100.0),
                 );
             }
             "obc.capture" => {
@@ -2932,6 +3078,8 @@ impl Sim {
             }
             "exp.reset" => {
                 let e = &mut self.exp;
+                e.sensor_actual = None;
+                e.sensor_readings = [None, None];
                 e.sln = false;
                 e.motor = false;
                 e.exp12v = false;

@@ -315,13 +315,13 @@ def main():
                         record[12:16] = (0xffffffff if kind and action else 5000 if action else 0).to_bytes(4, "little")
                         reply = "THM_STAT " + record.hex()
                     elif command == "bme688_cfg_get":
-                        reply = "BME688 config temp_os=2 press_os=3 hum_os=1 filter=2 gas=off heater_c=0 heater_10ms=0"
+                        reply = "BME688 CFG source=SENSOR_READBACK heater_profile=STORED_ONLY gas_support=0 t_os=2x p_os=4x h_os=1x filter=3 gas=0 heater_temp_c=320 heater_duration_ms=100"
                     elif command.startswith("bme688_cfg_set "):
                         reply = "BME688 QUEUED id=17"
                     elif command == "bme688_result 17":
                         reply = "BME688 DONE id=17"
                     elif command == "lsm6d_conf_get":
-                        reply = "desired xl=5/3 gyro=5/3; effective xl=5/3 gyro=5/3"
+                        reply = "config_valid=1\r\nWAKE_THS=0x14 WAKE_DUR=0x40 FREE_FALL=0xA3\r\ndesired xl=5/3 gyro=5/3 mode=0 event=0; effective xl=5/3 gyro=5/3 mode=0 event=0 last_error=0"
                     elif command.startswith("lsm6d_conf_") or command == "lsm6d_init":
                         reply = "LSM6DSOX QUEUED id=18; query lsm6d_result"
                     elif command == "lsm6d_result 18":
@@ -400,8 +400,8 @@ def main():
         exp_snapshot = pathlib.Path(tmp) / "exp_data.json"
         exp_snapshot.write_text(json.dumps({
             "online": 1, "data_valid": 1, "obc_timestamp": int(time.time()),
-            "sensor_valid_mask": 1 << 9,
-            "sensor_age_ms": [0] * 9 + [10],
+            "sensor_valid_mask": 1 << 7,
+            "sensor_age_ms": [0] * 7 + [10, 4294967295, 4294967295],
             "sensor_status": [2] * 10,
             "pwr_volt_mv": [12000, 11900, 5000, 5100],
             "pwr_curr_ma": [-25, 120, 50, 60],
@@ -461,7 +461,7 @@ def main():
             assert uvc["ok"] and uvc["length"] == 32, uvc
             assert bytes.fromhex(uvc["payload_hex"])[4:8] == b"MJPG", uvc
             capture = json.loads(call(path, "--json", "uvc_ctl", "2", "capture", "1042"))
-            assert capture["ok"] and capture["length"] == 8, capture
+            assert capture["ok"] and capture["length"] == 4, capture
             for _ in range(100):
                 state = json.loads(call(path, "--json", "uvc_stat", "2", "get", "1042"))
                 if bytes.fromhex(state["payload_hex"])[1] == 3:
@@ -471,10 +471,10 @@ def main():
                 raise AssertionError(state)
             assert (pathlib.Path(tmp) / "uvc/USB1_00001042.jpg").read_bytes().startswith(b"\xff\xd8")
             payload = bytes((2,)) + (1042).to_bytes(4, "little")
-            frame = bytes.fromhex("a5 01 12 05 00") + payload + binascii.crc_hqx(payload, 0xffff).to_bytes(2, "little")
+            frame = bytes.fromhex("a5 01 31 05 00") + payload + binascii.crc_hqx(payload, 0xffff).to_bytes(2, "little")
             os.write(master, frame)
             header = read_exact(master, 5)
-            assert header == bytes.fromhex("a5 01 12 08 00"), header.hex()
+            assert header == bytes.fromhex("a5 01 31 08 00"), header.hex()
             answer = read_exact(master, 10)
             assert answer[:8] == bytes((2, 3, 0, 0)) + (1042).to_bytes(4, "little"), answer.hex()
             assert binascii.crc_hqx(answer[:8], 0xffff) == int.from_bytes(answer[8:], "little"), answer.hex()
@@ -487,17 +487,19 @@ def main():
             readback = json.loads(call(path, "--json", "pdu_vout", "get"))
             assert readback["ok"] and readback["length"] == 8, readback
             assert bytes.fromhex(readback["payload_hex"]) == bytes.fromhex(
-                "e0 2e 18 2e f0 00 1d 00"), readback
+                "e0 2e 18 2e f0 00 3d 00"), readback
             os.write(master, bytes.fromhex("a5 01 02 00 00 ff ff"))
             header = read_exact(master, 5)
             assert header == bytes.fromhex("a5 01 02 08 00"), header.hex()
             answer = read_exact(master, 10)
-            assert answer[:8] == bytes.fromhex("e0 2e 18 2e f0 00 1d 00"), answer.hex()
-            os.write(master, bytes.fromhex("a5 01 02 02 00 e0 2e 11 c8"))
+            assert answer[:8] == bytes.fromhex("e0 2e 18 2e f0 00 3d 00"), answer.hex()
+            config_payload = bytes.fromhex("e0 2e 00 00 00 00 00 00")
+            os.write(master, bytes.fromhex("a5 01 02 08 00") + config_payload +
+                     binascii.crc_hqx(config_payload, 0xffff).to_bytes(2, "little"))
             header = read_exact(master, 5)
             assert header == bytes.fromhex("a5 01 02 08 00"), header.hex()
             answer = read_exact(master, 10)
-            assert answer[:8] == bytes.fromhex("e0 2e 18 2e f0 00 1d 00"), answer.hex()
+            assert answer[:8] == bytes.fromhex("e0 2e 18 2e f0 00 3d 00"), answer.hex()
             assert pdu_vout_writes == [12000, 12000]
             power = json.loads(call(path, "--json", "pwr_en", "PDU", "VOUT", "on"))
             assert power["ok"] and bytes.fromhex(power["payload_hex"]) == bytes.fromhex(
@@ -526,28 +528,35 @@ def main():
             assert power["ok"] and (leds / "en_i2c_mipicam_1/brightness").read_text().strip() == "0"
             power = json.loads(call(path, "--json", "pwr_en", "OBC", "AI_power", "off"))
             assert power["ok"] and (leds / "pow_onoff_ai/brightness").read_text().strip() == "0"
-            bad_power = json.loads(call(path, "--json", "raw", "1", "3"))
+            bad_power = json.loads(call(path, "--json", "raw", "1", "3", "0"))
             assert not bad_power["ok"] and bad_power["code"] == 0, bad_power
             payload = bytes.fromhex("03 01 00 01 00 00")
-            frame = bytes.fromhex("a5 01 03 06 00") + payload + binascii.crc_hqx(payload, 0xffff).to_bytes(2, "little")
+            frame = bytes.fromhex("a5 01 32 06 00") + payload + binascii.crc_hqx(payload, 0xffff).to_bytes(2, "little")
             os.write(master, frame)
             header = read_exact(master, 5)
-            assert header == bytes.fromhex("a5 01 03 07 00"), header.hex()
+            assert header == bytes.fromhex("a5 01 32 07 00"), header.hex()
             answer = read_exact(master, 9)
             assert answer[:3] == b"\x03\x01\0" and answer[3:5] == b"\xff\0", answer.hex()
-            status = json.loads(call(path, "--json", "pwr_stat", "OBC", "get"))
-            assert status["ok"] and status["length"] == 198, status
-            status = json.loads(call(path, "--json", "pwr_stat", "OBC", "get", "AI_power"))
-            assert status["ok"] and status["length"] == 18, status
-            row = bytes.fromhex(status["payload_hex"])[6:]
-            assert row[0] == 8 and row[1] & 1, row.hex()
-            status = json.loads(call(path, "--json", "pwr_stat", "EXP", "get", "12V_MOTOR"))
-            row = bytes.fromhex(status["payload_hex"])[6:]
-            assert status["ok"] and status["length"] == 18 and row[0] == 0, status
-            assert row[1] & 0x1c == 0x1c and int.from_bytes(row[4:8], "little") == 12000, row.hex()
-            assert int.from_bytes(row[8:12], "little", signed=True) == -25, row.hex()
-            status = json.loads(call(path, "--json", "pwr_stat", "PDU", "get"))
-            assert status["ok"] and status["length"] == 54, status
+            status = json.loads(call(path,"--json","pwr_stat","all"))
+            assert status["ok"] and status["length"]==184,status
+            raw=bytes.fromhex(status["payload_hex"])
+            assert raw[:4]==bytes.fromhex("00021b00"),raw.hex()
+            records={}
+            for off in range(6,len(raw)-16,6):
+                d=int.from_bytes(raw[off:off+2],"little")
+                records[(d>>4&7,d&15)]=(d>>7&31,int.from_bytes(raw[off+2:off+4],"little"),int.from_bytes(raw[off+4:off+6],"little",signed=True))
+            assert records[(3,8)][0]&1,records
+            flags,mv,ma=records[(4,0)]
+            assert flags&0x1c==0x1c and (mv,ma)==(12000,-25),records
+            for report,length in (("monitor",118),("enable",100)):
+                status=json.loads(call(path,"--json","pwr_stat",report))
+                assert status["ok"] and status["length"]==length,status
+            status=json.loads(call(path,"--json","pwr_stat","error"))
+            assert status["ok"] and status["length"]<=200,status
+            assert not json.loads(call(path,"--json","pwr_stat","OBC","get"))["ok"]
+            for payload in (b"",b"\x04",bytes(2),bytes(3)):
+                os.write(master,bytes([0xa5,1,4])+len(payload).to_bytes(2,"little")+payload+binascii.crc_hqx(payload,0xffff).to_bytes(2,"little"))
+                assert read_exact(master,7)==bytes.fromhex("a5 ff 00 00 00 ff ff")
             sensor = json.loads(call(path, "--json", "sen_stat", "PDU", "get", "temperature"))
             assert sensor["ok"] and sensor["type"] == 1 and sensor["address"] == 7, sensor
             assert sensor["length"] == 22, sensor
@@ -566,6 +575,22 @@ def main():
                 "pwr_volt_mv": [12000, 11900, 5000, 5100],
                 "pwr_curr_ma": [-25, 120, 50, 60]
             }))
+            native = json.loads(call(path,"--json","sen_stat","bme"))
+            assert native["ok"] and native["address"]==6, native
+            expected = bytes.fromhex("0700") + (2650).to_bytes(2,"little",signed=True) + (10132).to_bytes(2,"little") + (4450).to_bytes(2,"little")
+            assert bytes.fromhex(native["payload_hex"]) == expected, native
+            payload=b"\x02"
+            os.write(master, bytes.fromhex("a5 01 06 01 00")+payload+binascii.crc_hqx(payload,0xffff).to_bytes(2,"little"))
+            assert read_exact(master,5)==bytes.fromhex("a5 01 06 08 00")
+            native_frame=read_exact(master,10)
+            assert native_frame[:8]==expected, native_frame.hex()
+            assert int.from_bytes(native_frame[-2:],"little")==binascii.crc_hqx(expected,0xffff)
+            native = json.loads(call(path,"--json","sen_stat","imu"))
+            expected = bytes.fromhex("7f00") + b"".join(v.to_bytes(2,"little",signed=True) for v in (2700,0,0,1000,0,0,0))
+            assert bytes.fromhex(native["payload_hex"]) == expected, native
+            for payload in (b"", b"\x05", b"\x02\x00"):
+                os.write(master,bytes([0xa5,1,6])+len(payload).to_bytes(2,"little")+payload+binascii.crc_hqx(payload,0xffff).to_bytes(2,"little"))
+                assert read_exact(master,7)==bytes.fromhex("a5 ff 00 00 00 ff ff")
             sensor = json.loads(call(path, "--json", "sen_stat", "EXP", "get", "flow", "flow2"))
             assert sensor["ok"] and sensor["length"] == 34, sensor
             records = bytes.fromhex(sensor["payload_hex"])[10:]
@@ -586,6 +611,8 @@ def main():
             sensor = json.loads(call(path, "--json", "sen_stat", "EXP", "get", "bme"))
             assert sensor["ok"] and sensor["length"] == 10, sensor
             assert bytes.fromhex(sensor["payload_hex"])[3:6] == b"\x01\x00\xff", sensor
+            native=json.loads(call(path,"--json","sen_stat","bme"))
+            assert native["ok"] and native["payload_hex"]=="0000008000800080",native
             exp_snapshot.write_text(fresh_exp)
             payload = bytes.fromhex("04 04 06 00")
             frame = bytes.fromhex("a5 01 07 04 00") + payload + binascii.crc_hqx(payload, 0xffff).to_bytes(2, "little")
@@ -598,19 +625,18 @@ def main():
             invalid_sensor = json.loads(call(path, "--json", "sen_stat", "EXP", "get", "flow", "imu"))
             assert not invalid_sensor["ok"] and invalid_sensor["code"] == 1, invalid_sensor
             invalid_status = json.loads(call(path, "--json", "raw", "1", "4", "5", "16", "0"))
-            assert not invalid_status["ok"] and invalid_status["code"] == 1, invalid_status
-            payload = bytes.fromhex("03 00 01")
-            frame = bytes.fromhex("a5 01 04 03 00") + payload + binascii.crc_hqx(payload, 0xffff).to_bytes(2, "little")
-            os.write(master, frame)
-            header = read_exact(master, 5)
-            assert header == bytes.fromhex("a5 01 04 12 00"), header.hex()
-            answer = read_exact(master, 20)
-            assert answer[0] == 3 and answer[1] == 1 and answer[6] == 8, answer.hex()
-            assert binascii.crc_hqx(answer[:18], 0xffff) == int.from_bytes(answer[18:], "little"), answer.hex()
-            invalid = json.loads(call(path, "--json", "raw", "1", "2", "0", "0"))
+            assert not invalid_status["ok"] and invalid_status["code"] == 0, invalid_status
+            payload=b"\x00"
+            frame=bytes.fromhex("a5 01 04 01 00")+payload+binascii.crc_hqx(payload,0xffff).to_bytes(2,"little")
+            os.write(master,frame)
+            assert read_exact(master,5)==bytes.fromhex("a5 01 04 b8 00")
+            answer=read_exact(master,186)
+            assert answer[:4]==bytes.fromhex("00021b00"),answer.hex()
+            assert binascii.crc_hqx(answer[:-2],0xffff)==int.from_bytes(answer[-2:],"little")
+            invalid = json.loads(call(path, "--json", "raw", "1", "2", "0", "0", "0", "0", "0", "0", "0", "0"))
             assert not invalid["ok"] and invalid["code"] == 1 and pdu_vout_writes == [12000, 12000], invalid
             old_length = json.loads(call(path, "--json", "raw", "1", "2",
-                                         "224", "46", "0", "0", "0", "0", "0", "0"))
+                                         "224", "46"))
             assert not old_length["ok"] and old_length["code"] == 0, old_length
             before = int(time.time())
             rtc = json.loads(call(path, "--json", "sys_rtc"))
@@ -714,13 +740,14 @@ def main():
                     ("standby", "pc_standby"), ("stop", "pc_stop"),
                     ("reset_error", "pc_reset_error"), ("deactivate", "pc_deactivate")):
                 ctl = json.loads(call(path,"--json","pc_ctl",*console_args.split()))
-                assert ctl["ok"] and ctl["length"] == 0 and exp_commands[-1] == expected_cli, ctl
+                assert ctl["ok"] and ctl["length"] == 4 and exp_commands[-1] == expected_cli, ctl
             assert not json.loads(call(path,"--json","pc_ctl","ground","unknown"))["ok"]
             ctl_payload = bytes((3, 1)) + bytes(6)
             os.write(master, bytes.fromhex("a5 02 02 08 00") + ctl_payload +
                      binascii.crc_hqx(ctl_payload, 0xffff).to_bytes(2, "little"))
-            assert read_exact(master, 5) == bytes.fromhex("a5 02 02 00 00")
-            assert read_exact(master, 2) == bytes.fromhex("ff ff")
+            assert read_exact(master, 5) == bytes.fromhex("a5 02 02 04 00")
+            ctl_ack = read_exact(master, 6)
+            assert binascii.crc_hqx(ctl_ack[:4], 0xffff) == int.from_bytes(ctl_ack[4:], 'little')
             pc_status = json.loads(call(path,"--json","pc_stat"))
             assert pc_status["ok"] and pc_status["length"] == 1 and pc_status["payload_hex"] == "29", pc_status
             assert "state=test activated=yes" in pc_status["text"], pc_status
@@ -748,32 +775,32 @@ def main():
             assert not json.loads(call(path, "--json", "fld_cfg", "valve", "map", "0", "0", "2", "3"))["ok"]
             output = json.loads(call(path, "--json", "fld_ctl", "valve", "mask", "5"))
             assert output["ok"] and exp_commands[-1] == "pc_onground_control 1 0 1 0", output
-            output = json.loads(call(path, "--json", "fld_ctl", "pump", "u11", "frequency", "500"))
+            output = json.loads(call(path, "--json", "fld_job", "pump", "u11", "frequency", "500"))
             assert output["ok"] and output["length"] == 4 and "id=44" in output["text"] and exp_commands[-1] == "pump_set_freq 500", output
-            output = json.loads(call(path, "--json", "fld_ctl", "pump", "u15", "voltage", "2", "100"))
+            output = json.loads(call(path, "--json", "fld_job", "pump", "u15", "voltage", "2", "100"))
             assert output["ok"] and exp_commands[-1] == "pump4_set_volt 2 100", output
-            assert not json.loads(call(path, "--json", "fld_ctl", "pump", "u15", "voltage", "4", "100"))["ok"]
+            assert not json.loads(call(path, "--json", "fld_job", "pump", "u15", "voltage", "4", "100"))["ok"]
             output = json.loads(call(path, "--json", "fld_stat"))
             assert output["ok"] and output["length"] == 16, output
             assert bytes.fromhex(output["payload_hex"]) == bytes.fromhex("050f4f02f40178900119324b64000000"), output
             assert "fld_wire_stat" in exp_commands, output
-            motor = json.loads(call(path,"--json","rba_ctl","move","0","-120","80"))
+            motor = json.loads(call(path,"--json","rba_job","move","0","-120","80"))
             assert motor["ok"] and motor["length"] == 4 and "id=71" in motor["text"], motor
             assert exp_commands[-1] == "motor5_move 0 -120 80", exp_commands[-1]
-            motor = json.loads(call(path,"--json","rba_ctl","result","71"))
+            motor = json.loads(call(path,"--json","rba_job","result","71"))
             assert motor["ok"] and motor["length"] == 12 and "state=done position=123" in motor["text"], motor
             assert exp_commands[-1] == "motor5_result 71", exp_commands[-1]
-            motor = json.loads(call(path,"--json","rba_ctl","jog","1","ccw"))
+            motor = json.loads(call(path,"--json","rba_job","jog","1","ccw"))
             assert motor["ok"] and exp_commands[-1] == "motor5_run 1 ccw 0", motor
-            assert json.loads(call(path,"--json","rba_ctl","stop","all"))["ok"]
+            assert json.loads(call(path,"--json","rba_job","stop","all"))["ok"]
             assert exp_commands[-1] == "motor5_stop all", exp_commands[-1]
-            assert json.loads(call(path,"--json","rba_ctl","stop_hold","0"))["ok"]
+            assert json.loads(call(path,"--json","rba_job","stop_hold","0"))["ok"]
             assert exp_commands[-1] == "motor5_stop 0 hold", exp_commands[-1]
-            assert not json.loads(call(path,"--json","rba_ctl","stop_hold","all"))["ok"]
-            assert json.loads(call(path,"--json","rba_ctl","disable"))["ok"]
+            assert not json.loads(call(path,"--json","rba_job","stop_hold","all"))["ok"]
+            assert json.loads(call(path,"--json","rba_job","disable"))["ok"]
             assert exp_commands[-1] == "motor5_disable", exp_commands[-1]
-            assert not json.loads(call(path,"--json","rba_ctl","move","2","10"))["ok"]
-            assert not json.loads(call(path,"--json","rba_ctl","home","0","20"))["ok"]
+            assert not json.loads(call(path,"--json","rba_job","move","2","10"))["ok"]
+            assert not json.loads(call(path,"--json","rba_job","home","0","20"))["ok"]
             rba_status = json.loads(call(path,"--json","rba_stat"))
             assert rba_status["ok"] and rba_status["length"] == 16, rba_status
             assert "motor0 state=moving position=123" in rba_status["text"], rba_status
@@ -790,7 +817,7 @@ def main():
                      binascii.crc_hqx(rba_payload, 0xffff).to_bytes(2, "little"))
             assert read_exact(master, 5) == bytes.fromhex("a5 01 1a 04 00")
             rba_answer = read_exact(master, 6)
-            assert rba_answer[:4] == (71).to_bytes(4, "little")
+            assert int.from_bytes(rba_answer[:4], "little") > 0  # uptime ACK, not ticket 71
             assert binascii.crc_hqx(rba_answer[:4], 0xffff) == int.from_bytes(rba_answer[4:], "little")
             output = call(path, "thm_cfg", "heater", "0", "set", "max_duty", "60",
                           "slew", "5", "max_on_ms", "30000")
@@ -811,13 +838,36 @@ def main():
             output = call(path,"thm_ctl","ir","0","feedback_start")
             assert "accepted uptime=" in output, output
             output = json.loads(call(path,"--json","thm_stat","get"))
-            assert output["ok"] and output["length"]==6, output
+            assert output["ok"] and output["length"]==8 and output["payload_hex"].endswith("0000"), output
             assert "accepted uptime=" in call(path,"thm_ctl","ir","1","off")
             assert "ir1 stopped duty=0%" in wait_cached_text(path,"ir1 stopped duty=0%","thm_stat")
             assert not json.loads(call(path,"--json","thm_ctl","ir","1","set","10","500"))["ok"]
             assert not json.loads(call(path,"--json","thm_stat","get","ir","1"))["ok"]
+            cfg = json.loads(call(path, "--json", "sen_cfg", "get"))
+            assert cfg["ok"] and cfg["payload_hex"] == "5a11bd0394142300", cfg
+            for args in (("set", "bme", "2x", "4x", "1x", "3"),
+                         ("set", "imu", "accel", "208Hz", "8g"),
+                         ("set", "imu", "gyro", "208Hz", "1000dps"),
+                         ("set", "imu", "freefall", "3", "20"),
+                         ("set", "imu", "wakeup", "20", "2")):
+                cfg = json.loads(call(path, "--json", "sen_cfg", *args, timeout=10))
+                assert cfg["ok"] and cfg["length"] == 8, cfg
+            for args in (("get", "bme"), ("set", "both"), ("set", "bme", "32x", "1x", "1x", "off"),
+                         ("set", "imu", "wakeup", "64", "0")):
+                assert not json.loads(call(path, "--json", "sen_cfg", *args))["ok"]
+            for sensor, length in (("bme", 8), ("imu", 16)):
+                result = json.loads(call(path, "--json", "sen_stat", sensor))
+                assert result["ok"] and result["length"] == length, result
+            os.write(master, bytes.fromhex("a5 01 05 00 00 ff ff"))
+            assert read_exact(master, 5) == bytes.fromhex("a5 01 05 08 00")
+            packet = read_exact(master, 10)
+            assert packet[:8] == bytes.fromhex("5a11bd0394142300"), packet.hex()
+            assert int.from_bytes(packet[-2:], "little") == binascii.crc_hqx(packet[:-2], 0xffff)
+            for data in (b"\x01", bytes([3,0,0,0,0,0,0,0]), bytes([1,0,0,0,0,0,0,1])):
+                os.write(master, bytes([0xa5,1,5])+len(data).to_bytes(2,"little")+data+binascii.crc_hqx(data,0xffff).to_bytes(2,"little"))
+                assert read_exact(master,7) == bytes.fromhex("a5 ff 00 00 00 ff ff")
             output = json.loads(call(path, "--json", "sen_bme_cfg", "EXP", "get"))
-            assert output["ok"] and "temp_os=2" in output["text"], output
+            assert output["ok"] and "t_os=2x" in output["text"], output
             assert exp_commands[-1] == "bme688_cfg_get", exp_commands[-1]
             for field, value in (("duty_pct", "25"), ("burn_time_ms", "100"),
                                  ("max_total_current_ma", "1000")):
@@ -872,8 +922,14 @@ def main():
             length = int.from_bytes(header[3:5], "little")
             answer = read_exact(master, length + 2)
             assert answer[0] == 0 and b"PC state=IDLE" in answer, answer
-            output = call(path, "dat_lst")
-            assert "logs=" in output and "images=" in output, output
+            for bad_args in [(), ("256",), ("-1",), ("255", "0")]:
+                bad = subprocess.run([str(CLIENT), "--socket", str(path), "--json", "dat_lst", *bad_args],
+                                     text=True, capture_output=True, timeout=5)
+                response = json.loads(bad.stdout)
+                assert response["ok"] is False and "invalid command" in response["error"], response
+            for mark in ("0", "7", "254", "255", "0xFF"):
+                output = call(path, "dat_lst", mark)
+                assert "HK=" in output and "SCI1=" in output and "SCI2=" in output, output
             output = call(path, "dat_des")
             assert "OK dat_des: uptime=" in output, output
             output = json.loads(call(path, "--json", "ping"))

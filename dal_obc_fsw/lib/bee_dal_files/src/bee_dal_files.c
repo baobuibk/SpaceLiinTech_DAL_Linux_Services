@@ -1,3 +1,6 @@
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+#endif
 /* bee_dal_files.c */
 #include "bee_dal_files.h"
 #include "bee_dal_crc32.h"
@@ -263,9 +266,9 @@ static void scan_add_file(uint8_t type, const char *relpath, const char *name,
 }
 
 static const char *const source_dirs[3][4] = {
-    {"logs/hk", "logs/lwl", "logs/pc", NULL},
+    {"logs/hk", NULL},
     {"images/usb", "images/mipi", "images/exp", NULL},
-    {"data/lev", "data/other", NULL}
+    {"logs/lwl", "logs/pc", NULL}
 };
 
 static void scan_source(uint8_t type, const char *folder, uint32_t *seen)
@@ -335,13 +338,18 @@ xerr_t bee_dal_files_info(uint32_t snap_id, uint8_t data_type, uint32_t idx,
     if (fd < 0) return XERR_NOT_FOUND;
 
     uint32_t crc = bee_dal_crc32_init();
+    uint64_t bytes_read = 0;
     uint8_t  buf[CRC_STREAM_BLOCK];
     ssize_t  n;
-    while ((n = read(fd, buf, sizeof(buf))) > 0)
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
         crc = bee_dal_crc32_update(crc, buf, (size_t)n);
+        bytes_read += (size_t)n;
+    }
     close(fd);
 
     if (n < 0) return XERR_IO;
+    /* Listing fixes the file size. Re-list if it changes before selection. */
+    if (bytes_read != size) return XERR_STALE;
 
     if (out_size)  *out_size  = size;
     if (out_crc32) *out_crc32 = bee_dal_crc32_finalize(crc);
@@ -359,8 +367,7 @@ xerr_t bee_dal_files_read_chunk(uint32_t snap_id, uint8_t data_type, uint32_t id
     xerr_t   err  = resolve(snap_id, data_type, idx, path, sizeof(path), &size);
     if (err != XERR_OK) return err;
 
-    uint32_t nchunks = (size + chunk_size - 1) / chunk_size;
-    if (nchunks == 0) nchunks = 1; /* zero-byte file still has one (empty) chunk */
+    uint32_t nchunks = size / chunk_size + (size % chunk_size != 0);
     if (chunk_index >= nchunks) return XERR_RANGE;
 
     int fd = open(path, O_RDONLY);

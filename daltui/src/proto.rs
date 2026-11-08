@@ -228,7 +228,7 @@ pub fn pdu_vout_set(mv: u16) -> Cmd {
         format!("pdu_vout set {mv}"),
         1,
         2,
-        mv.to_le_bytes().to_vec(),
+        [mv.to_le_bytes().as_slice(), &[0; 6]].concat(),
         3,
     )
 }
@@ -302,7 +302,7 @@ pub fn exp_csp_snapshot(table: u8) -> Cmd {
 pub fn thp_cfg_get(i: u8) -> Cmd {
     let mut b = vec![0u8; 32];
     b[2] = i;
-    cmd(format!("thp_cfg heater get {i}"), 2, 0x03, b, 20)
+    cmd(format!("thp_cfg heater get {i}"), 2, 0x10, b, 20)
 }
 pub fn thp_cfg_set(i: u8, p: &crate::sim::HeaterProfile) -> Cmd {
     let mut b = vec![0u8; 32];
@@ -365,16 +365,8 @@ pub fn rba_stat() -> Cmd {
 pub fn pc_stat() -> Cmd {
     cmd("pc_stat", 2, 0x00, vec![], 20)
 }
-pub fn pwr_stat(board: Board) -> Cmd {
-    let mut p = vec![board as u8];
-    p.extend_from_slice(&0u16.to_le_bytes());
-    cmd(
-        format!("pwr_stat {} get", board.name()),
-        1,
-        4,
-        p,
-        if board == Board::Exp { 20 } else { 3 },
-    )
+pub fn pwr_stat() -> Cmd {
+    cmd("pwr_stat all", 1, 4, vec![0], 20)
 }
 
 /// Switch one output. `force` is only valid for EXP off.
@@ -410,7 +402,7 @@ pub fn pwr_en_mask(board: Board, select: u16, on: u16, force: bool, single: Opti
     cmd(
         text,
         1,
-        3,
+        0x32,
         p,
         if board == Board::Exp { 15 * (n + 1) } else { 3 },
     )
@@ -419,7 +411,7 @@ pub fn pwr_en_mask(board: Board, select: u16, on: u16, force: bool, single: Opti
 pub fn uvc_capture(camera: u8, id: u32) -> Cmd {
     let mut p = vec![camera, 1, 0, 0];
     p.extend_from_slice(&id.to_le_bytes());
-    cmd(format!("uvc_ctl {camera} capture {id}"), 1, 0x11, p, 5)
+    cmd(format!("uvc_job {camera} capture {id}"), 1, 0x35, p, 5)
 }
 
 pub fn uvc_led_pwm(camera: u8, duty: u8) -> Cmd {
@@ -438,7 +430,7 @@ pub fn uvc_led_pwm(camera: u8, duty: u8) -> Cmd {
 }
 
 pub fn uvc_cfg_get(camera: u8) -> Cmd {
-    cmd(format!("uvc_cfg {camera} get"), 1, 0x10, vec![camera], 5)
+    cmd(format!("uvc_cfg {camera} get"), 1, 0x30, vec![camera], 5)
 }
 
 /// Local flight console helper; never sent as a binary RS-422 frame.
@@ -458,7 +450,7 @@ pub fn port_cfg(args: &str) -> Cmd {
 pub fn uvc_stat(camera: u8, id: u32) -> Cmd {
     let mut p = vec![camera];
     p.extend_from_slice(&id.to_le_bytes());
-    cmd(format!("uvc_stat {camera} get {id}"), 1, 0x12, p, 5)
+    cmd(format!("uvc_stat {camera} get {id}"), 1, 0x31, p, 5)
 }
 
 /// `fld_ctl valve mask <0..15>` (01/17); all four logical V1–V4 directions.
@@ -485,7 +477,7 @@ pub fn fld_pump(dev: u8, op: u8, ch: u8, value: u32) -> Cmd {
         (_, 1) => format!("voltage {value}"),
         _ => format!("voltage {ch} {value}"),
     };
-    cmd(format!("fld_ctl pump {unit} {tail}"), 1, 0x17, p, 20)
+    cmd(format!("fld_job pump {unit} {tail}"), 1, 0x34, p, 20)
 }
 
 /// `fld_cfg pump detect <u11|u15>` (01/16, asynchronous: replies with a request id).
@@ -539,7 +531,7 @@ pub fn fld_pump_type(high: bool) -> Cmd {
 fn rba(action: u8, motor: u8, speed: u8, value: u32, text: String) -> Cmd {
     let mut p = vec![action, motor, speed, 0];
     p.extend_from_slice(&value.to_le_bytes());
-    cmd(text, 1, 0x1A, p, 20)
+    cmd(text.replace("rba_ctl", "rba_job"), 1, 0x33, p, 20)
 }
 pub fn rba_init() -> Cmd {
     rba(1, 2, 0, 0, "rba_ctl init".into())
@@ -686,31 +678,91 @@ pub struct PwrRec {
     pub age_ms: u16,
 }
 
-pub fn dec_pwr_stat(p: &[u8]) -> Option<(Board, u32, Vec<PwrRec>)> {
-    if p.len() < 6 || p.len() != 6 + 12 * p[1] as usize {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PduStatus {
+    pub valid: u16,
+    pub flags: u16,
+    pub mode: u8,
+    pub tps: u8,
+    pub temp: i16,
+    pub age_ms: u32,
+    pub setpoint: u16,
+}
+pub fn dec_pdu_status(p: &[u8]) -> Option<PduStatus> {
+    if p.len() < 22
+        || p.len() > 200
+        || p[0] > 3
+        || p[1] != 2
+        || p.len() != 22 + 6 * u16le(p, 2) as usize
+    {
         return None;
     }
-    let board = match p[0] {
-        3 => Board::Obc,
-        4 => Board::Exp,
-        5 => Board::Pdu,
-        _ => return None,
+    let at = p.len() - 16;
+    let x = PduStatus {
+        valid: u16le(p, at),
+        flags: u16le(p, at + 2),
+        mode: p[at + 4],
+        tps: p[at + 5],
+        temp: i16le(p, at + 6),
+        age_ms: u32le(p, at + 8),
+        setpoint: u16le(p, at + 12),
     };
-    let recs = (0..p[1] as usize)
-        .map(|i| {
-            let o = 6 + 12 * i;
-            let f = p[o + 1];
-            PwrRec {
-                bit: p[o],
-                state_known: f & 1 != 0,
-                on: f & 2 != 0,
-                mv: (f & 4 != 0).then(|| u32le(p, o + 4)),
-                ma: (f & 8 != 0).then(|| i32le(p, o + 8)),
-                age_ms: u16le(p, o + 2),
-            }
-        })
-        .collect();
-    Some((board, u32le(p, 2), recs))
+    if x.valid & !127 != 0
+        || x.tps > 4
+        || u16le(p, at + 14) != 0
+        || (x.valid & 2 != 0 && x.mode > 3)
+        || (x.valid == 0 && (x.tps != 0 || x.age_ms != u32::MAX))
+    {
+        return None;
+    }
+    Some(x)
+}
+
+pub fn dec_pwr_stat(p: &[u8], selected: Board) -> Option<(Board, u32, Vec<PwrRec>)> {
+    dec_pdu_status(p)?;
+    if p.len() < 6
+        || p.len() > 200
+        || p[0] > 3
+        || p[1] != 2
+        || p.len() != 22 + 6 * u16le(p, 2) as usize
+        || u16le(p, 4) & !0x8007 != 0
+    {
+        return None;
+    }
+    let mut seen = Vec::new();
+    let mut recs = Vec::new();
+    for at in (6..p.len() - 16).step_by(6) {
+        let d = u16le(p, at);
+        let board = (d >> 4) & 7;
+        let bit = (d & 15) as u8;
+        let f = (d >> 7) & 31;
+        let count = match board {
+            3 => 16,
+            4 => 7,
+            5 => 4,
+            _ => return None,
+        };
+        if d & 0xf000 != 0
+            || bit >= count
+            || seen.contains(&(board, bit))
+            || (f & 2 != 0 && f & 1 == 0)
+        {
+            return None;
+        }
+        seen.push((board, bit));
+        if board != selected as u16 {
+            continue;
+        }
+        recs.push(PwrRec {
+            bit,
+            state_known: f & 1 != 0,
+            on: f & 2 != 0,
+            mv: (f & 4 != 0).then(|| u16le(p, at + 2) as u32),
+            ma: (f & 8 != 0).then(|| i16le(p, at + 4) as i32),
+            age_ms: if f & 16 != 0 { 0 } else { u16::MAX },
+        });
+    }
+    Some((selected, 0, recs))
 }
 
 /// `pwr_en` reply: board, on mask, known mask, failed mask.
@@ -725,6 +777,7 @@ pub struct PduVout {
     pub ma: Option<u16>,
     pub trans_on: bool,
     pub vout_on: bool,
+    pub vout_known: bool,
 }
 
 pub fn dec_pdu_vout(p: &[u8]) -> Option<PduVout> {
@@ -738,6 +791,7 @@ pub fn dec_pdu_vout(p: &[u8]) -> Option<PduVout> {
         ma: (f & 16 != 0).then(|| u16le(p, 4)),
         trans_on: f & 1 != 0,
         vout_on: f & 2 != 0,
+        vout_known: f & 32 != 0,
     })
 }
 
@@ -770,7 +824,13 @@ pub fn dec_sys_info(p: &[u8]) -> Option<[BoardInfo; 3]> {
 
 /// `thm_stat`: heater 0-3 then IR 0-1, bit 7 running, bits 0-6 duty %.
 pub fn dec_thm_stat(p: &[u8]) -> Option<[(bool, u8); 6]> {
-    if p.len() != 6 {
+    if p.len() != 8
+        || p[6] != 0
+        || p[7] != 0
+        || p[..6]
+            .iter()
+            .any(|v| v & 0x7f > 100 || v & 0x80 != 0 && v & 0x7f == 0)
+    {
         return None;
     }
     let mut o = [(false, 0); 6];
@@ -868,8 +928,25 @@ mod tests {
 
     // Captured from the host dal_obc_fsw build (sandbox rig), `json <cmd>` -> payload_hex.
     const OBC_HK: &str = "ff01f70ee66a03000000dd09d204ea0bb80ba00f6009cd8b0100f21240e2010092138813e40c8813e40c46057e047e0483ffc8002c0190016400c8002c019001";
-    const PDU_STAT: &str = "0504010fe66a001d00000000000000000000011d00000000000000000000021400007c2e000000000000031400009213000000000000";
+    const PDU_STAT: &str = "000104000080d00e00000000d10e00000000520a7c2e0000530a92130000";
     const SYS_INFO: &str = "010307005d0fe66a00000000010101000000010030314132423343340000000000000000000000000201010000010203346463376262622d64697274790000000000000003010100000001000000000000000000000000000000000000000000";
+
+    #[test]
+    fn icd12_fixed_payloads_and_job_extensions_are_distinct() {
+        assert_eq!(pdu_vout_set(12000).payload.len(), 8);
+        assert_eq!(uvc_capture(2, 19).addr, 0x35);
+        assert_eq!(uvc_cfg_get(2).addr, 0x30);
+        assert_eq!(uvc_stat(2, 19).addr, 0x31);
+        assert_eq!(pwr_en(Board::Obc, 2, true, false).addr, 0x32);
+        assert_eq!(rba_init().addr, 0x33);
+        assert_eq!(fld_pump(1, 1, 0, 0).addr, 0x34);
+        assert_eq!(thp_cfg_get(2).addr, 0x10);
+        assert_eq!(thp_cfg_get(2).ty, 2);
+        assert_eq!(fld_valve_mask(5).addr, 0x17);
+        assert_eq!(fld_valve_mask(5).payload.len(), 8);
+        assert!(rba_init().text.starts_with("rba_job "));
+        assert!(uvc_capture(2, 19).text.starts_with("uvc_job "));
+    }
 
     #[test]
     fn crc_matches_ccsds_check_value() {
@@ -919,7 +996,10 @@ mod tests {
 
     #[test]
     fn decodes_pdu_power_status() {
-        let (b, _, r) = dec_pwr_stat(&from_hex(PDU_STAT).unwrap()).unwrap();
+        let mut p = from_hex(PDU_STAT).unwrap();
+        p[1] = 2;
+        p.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 0, 0]);
+        let (b, _, r) = dec_pwr_stat(&p, Board::Pdu).unwrap();
         assert_eq!(b, Board::Pdu);
         assert_eq!(r.len(), 4);
         assert!(r[0].state_known && !r[0].on);
@@ -974,7 +1054,10 @@ mod tests {
         assert_eq!(c.text, "pwr_en EXP SLN_HD off force");
         assert_eq!(c.payload, vec![4, 2, 0, 0, 0, 1]);
         assert_eq!(uvc_capture(2, 7).payload, vec![2, 1, 0, 0, 7, 0, 0, 0]);
-        assert_eq!(pdu_vout_set(12000).payload, vec![0xE0, 0x2E]);
+        assert_eq!(
+            pdu_vout_set(12000).payload,
+            vec![0xE0, 0x2E, 0, 0, 0, 0, 0, 0]
+        );
         let hb = pdu_heartbeat_set(2, 1500);
         assert_eq!(hb.text, "pdu_heartbeat on 1500");
         assert_eq!(
@@ -994,9 +1077,9 @@ mod tests {
             ("pdu_fault_clear", 1, 0x1c, &[][..])
         );
         let c = fld_pump(2, 3, 1, 40);
-        assert_eq!(c.text, "fld_ctl pump u15 voltage 1 40");
+        assert_eq!(c.text, "fld_job pump u15 voltage 1 40");
         assert_eq!(c.payload, vec![2, 3, 1, 0, 40, 0, 0, 0]);
-        assert_eq!(rba_stop(None).text, "rba_ctl stop all");
+        assert_eq!(rba_stop(None).text, "rba_job stop all");
         assert_eq!(rba_stop_hold(1).payload, vec![9, 1, 0, 0, 0, 0, 0, 0]);
         assert_eq!(fld_pump_detect(1).payload[..4], [1, 9, 0, 1]);
     }
@@ -1011,4 +1094,188 @@ pub fn pc_cfg(text: String, mut payload: [u8; 32]) -> Cmd {
 /// PC experiment operation, ICD 02/02.
 pub fn pc_ctl(op: u8, choice: u8, text: String) -> Cmd {
     cmd(text, 2, 2, vec![op, choice, 0, 0, 0, 0, 0, 0], 30)
+}
+
+// Native ICD v1.2 EXP sensor commands. SET affects one sensor/sub-operation.
+pub fn sen_cfg_get() -> Cmd {
+    cmd("sen_cfg get", 1, 5, vec![], 20)
+}
+pub fn sen_cfg_set(d: &[u8; 12], operation: usize) -> Cmd {
+    let mut p = vec![0; 8];
+    let text = if operation == 0 {
+        p[0] = 1;
+        p[2..6].copy_from_slice(&d[..4]);
+        let os = ["skip", "1x", "2x", "4x", "8x", "16x"];
+        let filter = ["off", "1", "3", "7", "15", "31", "63", "127"];
+        format!(
+            "sen_cfg set bme {} {} {} {}",
+            os[d[0] as usize], os[d[1] as usize], os[d[2] as usize], filter[d[3] as usize]
+        )
+    } else {
+        p[0] = 2;
+        p[1] = (operation - 1) as u8;
+        let at = 4 + 2 * (operation - 1);
+        p[2] = d[at];
+        p[3] = d[at + 1];
+        let op = ["accel", "gyro", "freefall", "wakeup"][operation - 1];
+        if operation <= 2 {
+            let odr = [
+                "off", "12.5Hz", "26Hz", "52Hz", "104Hz", "208Hz", "416Hz", "833Hz",
+            ];
+            let scale = if operation == 1 {
+                ["2g", "16g", "4g", "8g", "invalid"]
+            } else {
+                ["125dps", "250dps", "500dps", "1000dps", "2000dps"]
+            };
+            format!(
+                "sen_cfg set imu {op} {} {}",
+                odr[p[2] as usize], scale[p[3] as usize]
+            )
+        } else {
+            format!("sen_cfg set imu {op} {} {}", p[2], p[3])
+        }
+    };
+    cmd(text, 1, 5, p, 20)
+}
+pub fn sen_stat(imu: bool) -> Cmd {
+    cmd(
+        if imu { "sen_stat imu" } else { "sen_stat bme" },
+        1,
+        6,
+        vec![if imu { 3 } else { 2 }],
+        5,
+    )
+}
+/// Returns actual field codes and per-sensor validity; rejects reserved bits.
+pub fn dec_sen_cfg(p: &[u8]) -> Option<([u8; 12], [bool; 2])> {
+    if p.len() != 8
+        || p[0] & 0x80 != 0
+        || p[1] & 0xc0 != 0
+        || p[3] & 0xf8 != 0
+        || p[5] & 0xc0 != 0
+        || p[6] & 0xd8 != 0
+        || p[7] != 0
+    {
+        return None;
+    }
+    let d = [
+        p[0] & 7,
+        (p[0] >> 3) & 7,
+        p[1] & 7,
+        (p[1] >> 3) & 7,
+        p[2] & 7,
+        (p[2] >> 3) & 3,
+        p[2] >> 5,
+        p[3] & 7,
+        p[6] & 7,
+        p[4] & 63,
+        p[5] & 63,
+        p[4] >> 6,
+    ];
+    if d[..3].iter().any(|v| *v > 5) || d[7] > 4 {
+        return None;
+    }
+    Some((d, [p[0] & 0x40 != 0, p[6] & 0x20 != 0]))
+}
+pub fn dec_sen_stat(p: &[u8]) -> Option<Vec<Option<i16>>> {
+    let count = match p.len() {
+        8 => 3,
+        16 => 7,
+        _ => return None,
+    };
+    let mask = u16::from_le_bytes([p[0], p[1]]);
+    if mask >> count != 0 {
+        return None;
+    }
+    Some(
+        (0..count)
+            .map(|i| {
+                if mask & (1 << i) != 0 {
+                    Some(i16::from_le_bytes([p[2 + 2 * i], p[3 + 2 * i]]))
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod sensor_v12_tests {
+    use super::*;
+    #[test]
+    fn config_and_reports_match_v12_envelopes() {
+        let get = sen_cfg_get();
+        assert_eq!((get.ty, get.addr, get.payload.len()), (1, 5, 0));
+        let d = [2, 3, 1, 2, 5, 3, 4, 4, 3, 20, 20, 2];
+        let bme = sen_cfg_set(&d, 0);
+        assert_eq!(bme.payload, vec![1, 0, 2, 3, 1, 2, 0, 0]);
+        assert_eq!(bme.text, "sen_cfg set bme 2x 4x 1x 3");
+        let imu = sen_cfg_set(&d, 2);
+        assert_eq!(imu.payload, vec![2, 1, 4, 4, 0, 0, 0, 0]);
+        assert_eq!(imu.text, "sen_cfg set imu gyro 104Hz 2000dps");
+        assert_eq!(sen_stat(false).payload, vec![2]);
+        assert_eq!(sen_stat(true).addr, 6);
+        let decoded = dec_sen_cfg(&[0x5a, 0x11, 0x9d, 4, 0x94, 20, 0x23, 0]).unwrap();
+        assert_eq!(decoded, (d, [true, true]));
+        assert!(dec_sen_cfg(&[0; 7]).is_none());
+        assert!(dec_sen_cfg(&[0, 0, 0, 0, 0, 0, 0, 1]).is_none());
+        assert_eq!(dec_sen_cfg(&[0; 8]).unwrap().1, [false, false]);
+        assert_eq!(
+            dec_sen_stat(&[1, 0, 0xc4, 9, 0, 0, 0, 0]).unwrap(),
+            vec![Some(2500), None, None]
+        );
+        assert!(dec_sen_stat(&[8, 0, 0, 0, 0, 0, 0, 0]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod power_thermal_v12_tests {
+    use super::*;
+    #[test]
+    fn one_selector_and_aggregate_records_are_strict() {
+        let tc = pwr_stat();
+        assert_eq!((tc.ty, tc.addr, tc.payload.clone()), (1, 4, vec![0]));
+        assert_eq!(tc.text, "pwr_stat all");
+        assert_eq!(encode_tc(1, 4, &tc.payload).len(), 8);
+        let mut p = vec![0, 2, 1, 0, 0, 0x80];
+        p.extend_from_slice(&(0x40u16 | (0x1c << 7)).to_le_bytes());
+        p.extend_from_slice(&12000u16.to_le_bytes());
+        p.extend_from_slice(&(-25i16).to_le_bytes());
+        p.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 255, 255, 255, 0, 0]);
+        let (_, _, r) = dec_pwr_stat(&p, Board::Exp).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].mv, Some(12000));
+        assert_eq!(r[0].ma, Some(-25));
+        assert!(!r[0].state_known);
+        assert!(dec_pwr_stat(&p, Board::Pdu).unwrap().2.is_empty());
+        let mut bad = p.clone();
+        bad[3] = 1;
+        assert!(dec_pwr_stat(&bad, Board::Exp).is_none());
+        let mut bad = p.clone();
+        bad[7] |= 0x80;
+        assert!(dec_pwr_stat(&bad, Board::Exp).is_none());
+        let mut bad = p.clone();
+        bad.extend_from_slice(&p[6..]);
+        bad[2] = 2;
+        assert!(dec_pwr_stat(&bad, Board::Exp).is_none());
+        assert!(dec_pwr_stat(&vec![0; 201], Board::Exp).is_none());
+    }
+    #[test]
+    fn thermal_is_eight_bytes_with_six_channel_states() {
+        let p = [0xa8, 0, 1, 0, 0x8a, 100, 0, 0];
+        let v = dec_thm_stat(&p).unwrap();
+        assert_eq!(v[0], (true, 40));
+        assert_eq!(v[4], (true, 10));
+        assert!(dec_thm_stat(&p[..6]).is_none());
+        let mut bad = p;
+        bad[6] = 1;
+        assert!(dec_thm_stat(&bad).is_none());
+        let mut bad = p;
+        bad[0] = 0x80;
+        assert!(dec_thm_stat(&bad).is_none());
+        let mut bad = p;
+        bad[0] = 101;
+        assert!(dec_thm_stat(&bad).is_none());
+    }
 }

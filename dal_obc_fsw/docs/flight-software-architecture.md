@@ -157,7 +157,7 @@ dal_flight_console pwr_en OBC AI_power on
 dal_flight_console pdu_vout set 5000
 dal_flight_console exp_tlm sensors
 dal_flight_console exp_run pc_status
-dal_flight_console dat_lst
+dal_flight_console dat_lst 0xFF
 dal_flight_console dat_sel 0 0 1024
 dal_flight_console dat_get 0
 dal_flight_console dat_des

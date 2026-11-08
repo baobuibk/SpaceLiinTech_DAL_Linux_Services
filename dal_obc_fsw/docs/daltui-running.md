@@ -91,3 +91,11 @@ cargo build --release
 ```
 
 The serial link uses 921600 baud, 8N1, and no flow control. Substitute the actual adapter device and ensure your host user can open it. DALTUI sends the ICD `A5…CRC16` frames and receives telemetry on the same serial link. The Unix `console.sock` and optional `rs422.sock` are local to the OBC and cannot be opened from an external host. Features without an RS-422 command, such as MIPI route and capture through `gui_shell`, show as unavailable; use console mode on the OBC for those operations. Check the **CFG** page for link status and command history.
+
+## Collect OBC files
+
+See [Thu thập file trên OBC bằng DALTUI và command](obc-file-collection.md) for the OBC → Data transfer workflow, Pi download folders, console commands and RS-422 command-client downloads.
+
+## Windows terminal
+
+Use the Windows x64 executable with `--rs422 COM3` or `--sim`. See [Windows setup and EXE build](daltui-windows.md) for the package, optional build target and PowerShell commands.

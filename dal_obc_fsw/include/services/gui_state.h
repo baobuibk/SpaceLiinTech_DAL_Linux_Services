@@ -19,6 +19,7 @@ typedef struct {
 #define GUI_PDU_VOUT_SET_VALID   0x0004U
 #define GUI_PDU_VOUT_VOLT_VALID  0x0008U
 #define GUI_PDU_VOUT_CURR_VALID  0x0010U
+#define GUI_PDU_VOUT_STATE_VALID 0x0020U
 int gui_pdu_vout(bool set, uint16_t target_mv, gui_pdu_vout_t *result);
 
 /* PDU VOUT (bit 0) and TRANS (bit 1) Modbus coils; zero select reads the cache. */
@@ -32,7 +33,24 @@ int gui_pdu_heartbeat(uint8_t action, uint32_t period_ms,
 /* Write the PDU bootloader key; the MCU resets shortly after acknowledging. */
 int gui_pdu_enter_bootloader(void);
 
+#define PDU_VALID_FLAGS 1U
+#define PDU_VALID_MODE 2U
+#define PDU_VALID_TEMP 4U
+#define PDU_VALID_TRANS 8U
+#define PDU_VALID_VOUT 16U
+#define PDU_VALID_SETPOINT 32U
+#define PDU_VALID_RAILS 64U
+#define PDU_TPS_UNKNOWN 0U
+#define PDU_TPS_UNPOWERED 1U
+#define PDU_TPS_STARTING 2U
+#define PDU_TPS_READY 3U
+#define PDU_TPS_COMM_ERROR 4U
+
 typedef struct {
+    uint16_t valid, status_flags;
+    uint8_t mode, tps_state;
+    uint32_t age_ms;
+    uint16_t setpoint_mv;
     uint16_t vout_mv, vout_ma, trans_mv, trans_ma, input_12v_mv, input_5v_mv;
     int16_t temp_tenth;
     bool vout_on, trans_on;

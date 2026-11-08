@@ -49,10 +49,10 @@ class UvcPwm(unittest.TestCase):
             self.assertEqual(bytes.fromhex(reply["payload_hex"])[31], 40)
             self.assertEqual((profile / "camera2.bin").read_bytes()[31], 40)
             request = bytes([2, 1, 0, 0, 42, 0, 0, 0])
-            fsw.link.txrx(1, 0x11, request).expect_ack(1, 0x11, 8)
+            fsw.link.txrx(1, 0x11, request).expect_ack(1, 0x11, 4)
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
-                status = fsw.link.txrx(1, 0x12, bytes([2, 42, 0, 0, 0])).expect_ack(1, 0x12, 8)
+                status = fsw.link.txrx(1, 0x31, bytes([2, 42, 0, 0, 0])).expect_ack(1, 0x31, 8)
                 if status[1] in (3, 4):
                     break
                 time.sleep(0.05)
@@ -61,10 +61,10 @@ class UvcPwm(unittest.TestCase):
             self.assertEqual((pwm / "enable").read_text(), "0")
             self.assertTrue((fsw.tmp / "uvc/USB1_00000042.jpg").exists())
             (profile / "fail").touch()
-            fsw.link.txrx(1, 0x11, bytes([2, 1, 0, 0, 43, 0, 0, 0])).expect_ack(1, 0x11, 8)
+            fsw.link.txrx(1, 0x11, bytes([2, 1, 0, 0, 43, 0, 0, 0])).expect_ack(1, 0x11, 4)
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
-                status = fsw.link.txrx(1, 0x12, bytes([2, 43, 0, 0, 0])).expect_ack(1, 0x12, 8)
+                status = fsw.link.txrx(1, 0x31, bytes([2, 43, 0, 0, 0])).expect_ack(1, 0x31, 8)
                 if status[1] == 4:
                     break
                 time.sleep(0.05)

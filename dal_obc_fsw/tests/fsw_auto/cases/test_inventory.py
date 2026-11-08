@@ -17,6 +17,10 @@ class SourceDrift(FswTestCase):
         exp = body[body.index("case BEE_DAL_TYPE_EXP_CTRL"):body.index("case BEE_DAL_TYPE_SFU")]
         found |= {(2, int(a, 16)) for a in re.findall(r"f->addr\s*==\s*(0x[0-9a-fA-F]+)", exp)}
         found |= {(2, 0x0A), (2, 0x0B), (2, 0x0C)} if "BEE_DAL_EXP_PING" in exp else set()
+        protocol = (fixtures.ROOT / "lib/bee_dal_proto/include/bee_dal_proto.h").read_text()
+        for name, value in re.findall(r"#define (BEE_DAL_EXP_CSP_\w+) (0x[0-9A-Fa-f]+)U", protocol):
+            if re.search(r"f->addr\s*==\s*" + name + r"\b", exp):
+                found.add((2, int(value, 16)))
         have = {k for k in IMPLEMENTED if k[0] in (1, 2)}
         self.assertEqual(sorted(found - have), [], "dispatched in source but missing from inventory.py "
                          "(add tests and update docs/flight-command-register.md)")

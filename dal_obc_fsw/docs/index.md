@@ -21,7 +21,15 @@ all 43 revision 1.0 command rows with the current dispatcher.
 - [Map OBC GUI actions to RS-422](exp-gui-command-map.md), including the EXP
   device command catalog.
 
+- [Thu thập file trên OBC](obc-file-collection.md): quy trình DALTUI, console và PC command client; tải về Pi/PC và kiểm tra CRC32.
+
 ## Hardware references
+
+- [icd1.2](icd1.2.md): source ICD v1.2 tables, 42 TC/TM commands, RS-422 frames and navigation links.
+
+- [ICD v1.2 and console command mapping](icd-v1p2-console-mapping.md): native BME/IMU config and status, exact wire fields, and DALTUI operation.
+
+- [ICD v1.0 → v1.2 changes and migration TODO](icd-revision-changes.md): PDF differences, current implementation findings, and separate FSW/DALTUI checklists.
 
 - [BEE-DAL ICD revision 1.0](icd.md): editable RS-422 frame, command, telemetry,
   and file transfer tables with noted source discrepancies.

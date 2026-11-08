@@ -246,14 +246,24 @@ class ExpModel:
                         f"object={c['object']} seq={c['request']}\r\n"
                         f"CAMERA address camera={i} requested=0x{c['address']:02X} "
                         f"restart_required={int(c['restart_required'])} verified=1\r\n"
-                        f"CAMERA buffer={i} {'ENABLED' if c['buffer'] else 'DISABLED'} result=0")
-            if name == "camera_temp" and len(parts) == 6:
-                x, y, w, h = map(int, parts[2:])
-                if not (0 <= x < 32 and 0 <= y < 24 and 1 <= w <= 32 - x and
-                        1 <= h <= 24 - y and c["data_exist"]):
-                    return "ERROR CAMERA TEMP NOT_READY"
-                return (f"CAMERA_TEMP camera={i} request={c['request']} "
-                        f"roi={x},{y},{w},{h} max_cC={2400 + i*100 + x*4 + y*2} sample_ms=1000")
+                        f"CAMERA buffer={i} {'ENABLED' if c['buffer'] else 'DISABLED'} result=0\r\n"
+                        + c.get("point", ""))
+            if name == "camera_point" and len(parts) == 5:
+                x, y, delta = map(int, parts[2:])
+                if not (0 <= x < 32 and 0 <= y < 24 and 0 <= delta <= 31):
+                    return f"CAMERA camera={i} request=0 result=INVALID"
+                if not c["initialized"]:
+                    return f"CAMERA camera={i} request=0 result=NOT_INITIALIZED"
+                c["request"] += 1
+                c["result"] = "OK"
+                x0, y0 = max(0, x-delta), max(0, y-delta)
+                x1, y1 = min(31, x+delta), min(23, y+delta)
+                base = 2400 + i*100
+                c["point"] = (f"CAMERA_POINT camera={i} request={c['request']} valid=1 "
+                              f"x={x} y={y} delta={delta} center_cC={base+x*4+y*2} "
+                              f"max_cC={base+x1*4+y1*2} mean_cC={base+(x0+x1)*2+y0+y1} "
+                              "sample_ms=1000 error=0")
+                return f"CAMERA camera={i} request={c['request']} result=QUEUED"
         except (IndexError, ValueError):
             pass
         return "ERROR CAMERA INVALID"

@@ -212,9 +212,9 @@ static char *token(char **cursor) { return strtok_r(NULL, " \t", cursor); }
 static int data_type_arg(const char *arg, uint32_t *type)
 {
     if (!arg) return -1;
-    if (!strcmp(arg, "logs")) { *type = 0; return 0; }
-    if (!strcmp(arg, "images")) { *type = 1; return 0; }
-    if (!strcmp(arg, "data")) { *type = 2; return 0; }
+    if (!strcmp(arg, "hk") || !strcmp(arg, "housekeeping")) { *type = 0; return 0; }
+    if (!strcmp(arg, "images") || !strcmp(arg, "sci1")) { *type = 1; return 0; }
+    if (!strcmp(arg, "logs") || !strcmp(arg, "sci2") || !strcmp(arg, "data")) { *type = 2; return 0; }
     return number(arg, 2, type);
 }
 
@@ -332,22 +332,6 @@ static int power_line_bit(uint8_t addr, const char *name)
     return -1;
 }
 
-static int power_stat_bit(uint8_t board, const char *name)
-{
-    static const char *const obc[]={"5V_SAMA7","5V_FPGA","3V3","5V_AI",
-        "PMIC_3V3","PMIC_DDR_1V35","PMIC_CORE_1V15","PMIC_CPU_1V15",
-        "AI_power","FPGA_power","USB1_power","USB2_power","USB3_power",
-        "USB4_power","MIPI1_power","MIPI2_power"};
-    static const char *const exp[]={"12V_MOTOR","12V_EXP","5V_EXP","5V_SLN_HD",
-        "EXP12V","SLN_HD","MOTOR"};
-    static const char *const pdu[]={"VOUT","TRANS","INPUT_12V","INPUT_5V"};
-    const char *const *names=board==3 ? obc : board==4 ? exp : pdu;
-    size_t count=board==3 ? 16U : board==4 ? 7U : 4U;
-    if (!name) return -1;
-    for (size_t i=0;i<count;i++) if (!strcasecmp(name,names[i])) return (int)i;
-    return -1;
-}
-
 static int parse_command(char *line, uint8_t *type, uint8_t *addr,
                          uint8_t *payload, uint16_t *length)
 {
@@ -357,8 +341,15 @@ static int parse_command(char *line, uint8_t *type, uint8_t *addr,
     if (!cmd) return -1;
     *length = 0;
     if (!strcmp(cmd, "ping")) { *type = 0; *addr = 0; }
-    else if (!strcmp(cmd, "sys_info")) { *type = 1; *addr = 0; }
-    else if (!strcmp(cmd, "sys_rtc")) {
+    else if (!strcmp(cmd, "sys_info")) {
+        *type = 1; *addr = 0;
+        char *action = token(&save);
+        if (action) {
+            if (strcmp(action, "self_test") || token(&save)) return -1;
+            payload[0] = 1; *length = 1;
+        }
+    }
+    else if (!strcmp(cmd, "sys_rtc") || !strcmp(cmd, "sys_rtc_cfg")) {
         char *arg = token(&save);
         *type = 1; *addr = 1;
         if (arg) {
@@ -375,7 +366,8 @@ static int parse_command(char *line, uint8_t *type, uint8_t *addr,
         if (!strcmp(action, "get")) { /* zero-byte read */ }
         else if (!strcmp(action, "set")) {
             if (number(token(&save), 20000, &a) || a < 800) return -1;
-            *length = 2;
+            *length = 8;
+            memset(payload, 0, 8);
             bee_dal_put_u16(payload, &(size_t){0}, (uint16_t)a);
         } else return -1;
     }
@@ -413,11 +405,25 @@ static int parse_command(char *line, uint8_t *type, uint8_t *addr,
     }
     else if (!strcmp(cmd,"pwr_en")) {
         char *board_name=token(&save);
+        if (board_name && !strcmp(board_name, "get")) {
+            if (token(&save)) return -1;
+            *type = 1; *addr = 3; return 0;
+        }
+        if (board_name && (!strcmp(board_name, "on") || !strcmp(board_name, "off"))) {
+            bool on = !strcmp(board_name, "on");
+            if (number(token(&save), 0x1fff, &a) || !a) return -1;
+            char *option = token(&save);
+            if (option && (strcmp(option, "force") || on || (a & ~0x700u))) return -1;
+            if (token(&save)) return -1;
+            uint16_t word = (uint16_t)a | (on ? 0x2000u : 0) | (option ? 0x4000u : 0);
+            *type = 1; *addr = 3; *length = 2;
+            bee_dal_put_u16(payload, &(size_t){0}, word); return 0;
+        }
         uint8_t board=board_name && !strcasecmp(board_name,"OBC") ? 3 :
                       board_name && !strcasecmp(board_name,"EXP") ? 4 :
                       board_name && !strcasecmp(board_name,"PDU") ? 5 : 0;
         char *action=token(&save);
-        *type=1; *addr=3;
+        *type=1; *addr=0x32;
         if (!board || !action) return -1;
         payload[0]=board; *length=1;
         if (!strcasecmp(action,"get")) { /* board-only read */ }
@@ -457,31 +463,51 @@ static int parse_command(char *line, uint8_t *type, uint8_t *addr,
         }
     }
     else if (!strcmp(cmd,"pwr_stat")) {
-        char *board_name=token(&save);
-        uint8_t board=board_name && !strcasecmp(board_name,"OBC") ? 3 :
-                      board_name && !strcasecmp(board_name,"EXP") ? 4 :
-                      board_name && !strcasecmp(board_name,"PDU") ? 5 : 0;
+        char *report=token(&save);
+        static const char *const names[]={"all","monitor","enable","error"};
+        if (!report || token(&save)) return -1;
+        unsigned i;for (i=0;i<4;i++) if (!strcasecmp(report,names[i])) break;
+        if (i==4) return -1;
+        *type=1;*addr=4;*length=1;payload[0]=(uint8_t)i;
+    }
+    else if (!strcmp(cmd,"sen_cfg")) {
         char *action=token(&save);
-        if (!board || !action || strcasecmp(action,"get")) return -1;
-        char *name=token(&save);
-        uint16_t mask=0;
-        if (name && strcasecmp(name,"all")) {
-            if (!strcasecmp(name,"mask")) {
-                uint32_t value;
-                if (number(token(&save),UINT16_MAX,&value)) return -1;
-                mask=(uint16_t)value;
-            } else {
-                int bit=power_stat_bit(board,name);
-                if (bit<0) return -1;
-                mask=(uint16_t)(1U<<bit);
-            }
-        }
-        if (token(&save)) return -1;
-        *type=1;*addr=4;*length=3;
-        payload[0]=board;payload[1]=(uint8_t)mask;payload[2]=(uint8_t)(mask>>8);
+        if (!action) return -1;
+        *type=1;*addr=5;*length=0;
+        if (!strcasecmp(action,"get")) {if (token(&save)) return -1;}
+        else if (!strcasecmp(action,"set")) {
+            char *sensor=token(&save);if (!sensor) return -1;
+            memset(payload,0,8);*length=8;
+            if (!strcasecmp(sensor,"bme")) {
+                int t=bme_os_code(token(&save)),p=bme_os_code(token(&save));
+                int h=bme_os_code(token(&save)),f=bme_filter_code(token(&save));
+                if (t<=0 || p<=0 || h<=0 || f<0) return -1;
+                payload[0]=1;payload[2]=t;payload[3]=p;payload[4]=h;payload[5]=f;
+            } else if (!strcasecmp(sensor,"imu")) {
+                char *op=token(&save);if (!op) return -1;payload[0]=2;
+                if (!strcasecmp(op,"accel") || !strcasecmp(op,"gyro")) {
+                    bool gyro=!strcasecmp(op,"gyro");
+                    int odr=imu_odr_code(token(&save)),scale=imu_scale_code(token(&save),gyro);
+                    if (odr<0 || scale<0) return -1;
+                    payload[1]=gyro;payload[2]=odr;payload[3]=scale;
+                } else if (!strcasecmp(op,"freefall") || !strcasecmp(op,"wakeup")) {
+                    bool ff=!strcasecmp(op,"freefall");
+                    if (number(token(&save),ff?7:63,&a) || number(token(&save),ff?63:3,&b)) return -1;
+                    payload[1]=ff?2:3;payload[2]=a;payload[3]=b;
+                } else return -1;
+            } else return -1;
+            if (token(&save)) return -1;
+        } else return -1;
     }
     else if (!strcmp(cmd,"sen_stat")) {
         char *board_name=token(&save);
+        static const char *const reports[] = {"all", "temperature", "bme", "imu", "flow"};
+        for (unsigned report = 0; board_name && report < 5; ++report) {
+            if (strcasecmp(board_name, reports[report])) continue;
+            if (token(&save)) return -1;
+            *type=1;*addr=6;*length=1;payload[0]=(uint8_t)report;
+            return 0;
+        }
         uint8_t board=board_name && !strcasecmp(board_name,"OBC") ? 3 :
                       board_name && !strcasecmp(board_name,"EXP") ? 4 :
                       board_name && !strcasecmp(board_name,"PDU") ? 5 : 0;
@@ -532,11 +558,11 @@ static int parse_command(char *line, uint8_t *type, uint8_t *addr,
         if (action && strcasecmp(action,"get")) return -1;
         if (token(&save)) return -1;
     }
-    else if (!strcmp(cmd,"rba_ctl")) {
+    else if (!strcmp(cmd,"rba_ctl") || !strcmp(cmd,"rba_job")) {
         char *action=token(&save), *motor=NULL, *argument=NULL, *speed=NULL;
         int32_t signed_value=0;
         uint32_t value=0;
-        *type=1;*addr=0x1a;*length=8;
+        *type=1;*addr=!strcmp(cmd,"rba_job") ? 0x33 : 0x1a;*length=8;
         memset(payload,0,8);
         if (!action) return -1;
         if (!strcasecmp(action,"init") || !strcasecmp(action,"disable")) {
@@ -589,9 +615,9 @@ static int parse_command(char *line, uint8_t *type, uint8_t *addr,
         if (action && strcasecmp(action,"get")) return -1;
         if (token(&save)) return -1;
     }
-    else if (!strcmp(cmd,"fld_ctl")) {
+    else if (!strcmp(cmd,"fld_ctl") || !strcmp(cmd,"fld_job")) {
         char *device=token(&save), *action=token(&save), *arg;
-        *type=1;*addr=0x17;*length=8;
+        *type=1;*addr=!strcmp(cmd,"fld_job") ? 0x34 : 0x17;*length=8;
         memset(payload,0,8);
         if (!device || !action) return -1;
         if (!strcasecmp(device,"valve")) {
@@ -622,7 +648,7 @@ static int parse_command(char *line, uint8_t *type, uint8_t *addr,
             for (unsigned i=0;i<4;i++) payload[4+i]=(uint8_t)(a>>(8*i));
         } else return -1;
     }
-    else if (!strcmp(cmd,"pc_stat")) {
+    else if (!strcmp(cmd,"pc_stat") || !strcmp(cmd,"exp_stat")) {
         char *action=token(&save);
         if ((action && strcasecmp(action,"get")) || token(&save)) return -1;
         *type=2;*addr=0x00;
@@ -630,12 +656,15 @@ static int parse_command(char *line, uint8_t *type, uint8_t *addr,
     else if (!strcmp(cmd,"thp_cfg")) {
         char *kind=token(&save),*action=token(&save);
         uint32_t profile;
+        if (kind && !strcmp(kind,"get") && !action) {
+            *type=2;*addr=0x03;return 0;
+        }
         if (!kind || !action) return -1;
         memset(payload,0,32);*type=2;*addr=0x03;*length=32;
         if (!strcasecmp(kind,"heater")) payload[1]=0;
         else if (!strcasecmp(kind,"ir")) payload[1]=1;
         else return -1;
-        if (!strcasecmp(action,"get")) payload[0]=0;
+        if (!strcasecmp(action,"get")) {payload[0]=0;*addr=0x10;}
         else if (!strcasecmp(action,"set")) payload[0]=1;
         else return -1;
         if (number(token(&save),payload[1]?1:3,&profile)) return -1;
@@ -659,8 +688,11 @@ static int parse_command(char *line, uint8_t *type, uint8_t *addr,
                 thp_gain_arg(&save,payload,28) || token(&save)) return -1;
         }
     }
-    else if (!strcmp(cmd,"thp_ctl")) {
+    else if (!strcmp(cmd,"thp_ctl") || !strcmp(cmd,"thp_en")) {
         char *kind=token(&save),*index=token(&save),*action=token(&save);
+        if (kind && !strcmp(kind,"get") && !index && !action) {
+            *type=2;*addr=4;return 0;
+        }
         uint32_t channel;
         if (!kind || !index || !action || token(&save)) return -1;
         *type=2;*addr=0x04;*length=1;
@@ -677,7 +709,7 @@ static int parse_command(char *line, uint8_t *type, uint8_t *addr,
         else return -1;
         payload[0]=(uint8_t)(channel|(kind_code<<2)|(action_code<<3));
     }
-    else if (!strcmp(cmd,"pc_ctl")) {
+    else if (!strcmp(cmd,"pc_ctl") || !strcmp(cmd,"exp_ctl")) {
         char *action=token(&save), *selection=NULL;
         if (!action) return -1;
         *type=2;*addr=0x02;*length=8;
@@ -707,15 +739,16 @@ static int parse_command(char *line, uint8_t *type, uint8_t *addr,
         }
         if (token(&save)) return -1;
     }
-    else if (!strcmp(cmd,"fld_cfg") || !strcmp(cmd,"pc_cfg")) {
+    else if (!strcmp(cmd,"fld_cfg") || !strcmp(cmd,"pc_cfg") || !strcmp(cmd,"exp_cfg")) {
         char *group=token(&save),*name;
-        bool pc=!strcmp(cmd,"pc_cfg");
+        bool pc=strcmp(cmd,"fld_cfg")!=0;
         *type=pc?2:1;*addr=pc?0x01:0x16;
         if (group && !strcasecmp(group,"get")) {
             char *page=token(&save);
             if (page) {
                 if (number(page,219,&a) || token(&save)) return -1;
                 memset(payload,0,32);payload[1]=(uint8_t)a;*length=32;
+                *addr=pc?0x12:0x36;
             }
             return 0;
         }
@@ -880,13 +913,18 @@ static int parse_command(char *line, uint8_t *type, uint8_t *addr,
         } else return -1;
     }
     else if (!strcmp(cmd,"uvc_cfg")) {
-        if (number(token(&save),4,&a) || a<1) return -1;
+        char *camera = token(&save);
+        if (camera && !strcmp(camera,"get")) {
+            if (token(&save)) return -1;
+            *type=1;*addr=0x10;return 0;
+        }
+        if (number(camera,4,&a) || a<1) return -1;
         char *action=token(&save);
         if (!action) return -1;
         *type=1;*addr=0x10;payload[0]=(uint8_t)a;
         if (!strcasecmp(action,"get")) {
             if (token(&save)) return -1;
-            *length=1;
+            *length=1;*addr=0x30;
         } else if (!strcasecmp(action,"set")) {
             memset(payload+1,0,31);payload[1]=1;*length=32;
             char *name;uint16_t mask=0;
@@ -942,13 +980,15 @@ static int parse_command(char *line, uint8_t *type, uint8_t *addr,
             payload[2]=mask;payload[3]=mask>>8;
         } else return -1;
     }
-    else if (!strcmp(cmd,"uvc_ctl") || !strcmp(cmd,"uvc_stat")) {
-        bool capture=!strcmp(cmd,"uvc_ctl");
-        if (number(token(&save),4,&a) || a<1) return -1;
+    else if (!strcmp(cmd,"uvc_ctl") || !strcmp(cmd,"uvc_job") || !strcmp(cmd,"uvc_stat")) {
+        bool capture=strcmp(cmd,"uvc_stat")!=0;
+        char *camera = token(&save);
+        if (!capture && !camera) {*type=1;*addr=0x12;return 0;}
+        if (number(camera,4,&a) || a<1) return -1;
         char *action=token(&save);
         if (!action || strcasecmp(action,capture?"capture":"get") ||
             number(token(&save),UINT32_MAX,&b) || !b || token(&save)) return -1;
-        *type=1;*addr=capture?0x11:0x12;*length=capture?8:5;
+        *type=1;*addr=capture?(!strcmp(cmd,"uvc_job")?0x35:0x11):0x31;*length=capture?8:5;
         payload[0]=(uint8_t)a;
         if (capture) {payload[1]=1;payload[2]=0;payload[3]=0;}
         size_t off=capture?4:1;
@@ -1099,16 +1139,16 @@ static int parse_command(char *line, uint8_t *type, uint8_t *addr,
     }
     else if (!strcmp(cmd, "dat_lst")) {
         *type = 3; *addr = 0;
-        char *arg = token(&save);
-        if (arg) { if (number(arg, 255, &a)) return -1; payload[0] = a; *length = 1; }
+        if (number(token(&save), 255, &a)) return -1;
+        payload[0] = (uint8_t)a; *length = 1;
     }
     else if (!strcmp(cmd, "dat_sel")) {
-        if (data_type_arg(token(&save), &a) || number(token(&save), UINT16_MAX, &b) ||
+        if (data_type_arg(token(&save), &a) || number(token(&save), UINT32_MAX, &b) ||
             number(token(&save), BEE_DAL_MAX_PAYLOAD, &c) || c == 0) return -1;
-        *type = 3; *addr = 1; *length = 5;
+        *type = 3; *addr = 1; *length = 7;
         size_t off = 0;
         bee_dal_put_u8(payload, &off, a);
-        bee_dal_put_u16(payload, &off, b);
+        bee_dal_put_u32(payload, &off, b);
         bee_dal_put_u16(payload, &off, c);
     }
     else if (!strcmp(cmd, "dat_get")) {
@@ -1123,7 +1163,7 @@ static int parse_command(char *line, uint8_t *type, uint8_t *addr,
         size_t off = 0;
         bee_dal_put_u8(payload, &off, a); bee_dal_put_u32(payload, &off, b);
     }
-    else if (!strcmp(cmd, "dat_mark")) {
+    else if ((!strcmp(cmd, "dat_mark") || !strcmp(cmd, "dat_mrk"))) {
         if (number(token(&save), 254, &a)) return -1;
         *type = 3; *addr = 5; *length = 1; payload[0] = a;
     }
@@ -1152,6 +1192,10 @@ static int parse_command(char *line, uint8_t *type, uint8_t *addr,
         }
     }
     else return -1;
+    if (*length == 32 && payload[0] == 0 && strcmp(cmd, "raw")) {
+        if (*type == 1 && *addr == 0x16) *addr = 0x36;
+        else if (*type == 2 && *addr == 0x01) *addr = 0x12;
+    }
     return token(&save) ? -1 : 0;
 }
 
@@ -1199,7 +1243,9 @@ static void render_reply(const char *command, uint8_t type, uint8_t addr,
         for (uint32_t i = 0; i < n; ++i)
             append(info, sizeof(info), &used, "%c", reply->payload[7 + i]);
     }
-    else if ((type == 0 || (type == 3 && (addr == 3 || addr == 5))) && reply->length >= 4) {
+    else if ((type == 0 || (type == 3 && (addr == 3 || addr == 5)) ||
+              (type == 1 && (addr == 0x11 || addr == 0x17 || addr == 0x1a)) ||
+              (type == 2 && addr == 2)) && reply->length == 4) {
         size_t off = 0;
         append(info, sizeof(info), &used, "uptime=%" PRIu32 "s", bee_dal_get_u32(reply->payload, &off));
     }
@@ -1233,7 +1279,7 @@ static void render_reply(const char *command, uint8_t type, uint8_t addr,
         uint16_t flags = bee_dal_get_u16(reply->payload, &off);
         append(info, sizeof(info), &used, "TRANS=%s VOUT=%s setpoint=",
                flags & GUI_PDU_VOUT_TRANS_ON ? "on" : "off",
-               flags & GUI_PDU_VOUT_ENABLED ? "on" : "off");
+               !(flags&GUI_PDU_VOUT_STATE_VALID) ? "unknown" : flags & GUI_PDU_VOUT_ENABLED ? "on" : "off");
         if (flags & GUI_PDU_VOUT_SET_VALID) append(info, sizeof(info), &used, "%u mV", setpoint);
         else append(info, sizeof(info), &used, "unavailable");
         append(info, sizeof(info), &used, " measured=");
@@ -1243,7 +1289,26 @@ static void render_reply(const char *command, uint8_t type, uint8_t addr,
         if (flags & GUI_PDU_VOUT_CURR_VALID) append(info, sizeof(info), &used, "%u mA", current);
         else append(info, sizeof(info), &used, "unavailable");
     }
-    else if (type == 1 && addr == 3 && reply->length == 7) {
+    else if (type == 1 && addr == 3 && reply->length == 2) {
+        size_t off = 0;
+        uint16_t value = bee_dal_get_u16(reply->payload, &off);
+        append(info,sizeof(info),&used,"global_on_mask=0x%04x OBC_valid=%u EXP_valid=%u PDU_valid=%u",
+               value & 0x1fffu, !!(value & 0x2000u), !!(value & 0x4000u), !!(value & 0x8000u));
+    }
+    else if (type == 1 && addr == 0x12 && reply->length == 6) {
+        size_t off = 0;
+        uint16_t states = bee_dal_get_u16(reply->payload, &off);
+        uint16_t errors = bee_dal_get_u16(reply->payload, &off);
+        uint16_t known = bee_dal_get_u16(reply->payload, &off);
+        static const char *const names[] = {"unknown", "queued", "capturing", "saved", "failed"};
+        for (unsigned i = 0; i < 4; ++i) {
+            unsigned state = (states >> (4 * i)) & 15;
+            append(info,sizeof(info),&used,"%scamera%u known=%u state=%s error=%u",
+                   i ? "\n" : "", i + 1, !!(known & (1u << i)),
+                   state < 5 ? names[state] : "invalid", (errors >> (4 * i)) & 15);
+        }
+    }
+    else if (type == 1 && addr == 0x32 && reply->length == 7) {
         size_t off=1;
         uint16_t on=bee_dal_get_u16(reply->payload,&off);
         uint16_t known=bee_dal_get_u16(reply->payload,&off);
@@ -1269,40 +1334,32 @@ static void render_reply(const char *command, uint8_t type, uint8_t addr,
                reply->payload[0]==1 ? "accepted" : "rejected");
         if (reply->payload[0]!=1) ok=false;
     }
-    else if (type == 1 && addr == 4 && reply->length>=6 &&
-             reply->length==6U+12U*reply->payload[1]) {
-        static const char *const obc[]={"5V_SAMA7","5V_FPGA","3V3","5V_AI",
-            "PMIC_3V3","PMIC_DDR_1V35","PMIC_CORE_1V15","PMIC_CPU_1V15",
-            "AI_power","FPGA_power","USB1_power","USB2_power","USB3_power",
-            "USB4_power","MIPI1_power","MIPI2_power"};
-        static const char *const exp[]={"12V_MOTOR","12V_EXP","5V_EXP","5V_SLN_HD",
-            "EXP12V","SLN_HD","MOTOR"};
-        static const char *const pdu[]={"VOUT","TRANS","INPUT_12V","INPUT_5V"};
-        uint8_t board=reply->payload[0],count=reply->payload[1];
-        const char *const *names=board==3 ? obc : board==4 ? exp : pdu;
-        size_t limit=board==3 ? 16U : board==4 ? 7U : 4U;
-        size_t off=2;
-        uint32_t epoch=bee_dal_get_u32(reply->payload,&off);
-        append(info,sizeof(info),&used,"board=%s epoch=%" PRIu32 " records=%u",
-               board==3 ? "OBC" : board==4 ? "EXP" : "PDU",epoch,count);
-        for (unsigned i=0;i<count;i++) {
-            uint8_t bit=bee_dal_get_u8(reply->payload,&off);
-            uint8_t flags=bee_dal_get_u8(reply->payload,&off);
-            uint16_t age=bee_dal_get_u16(reply->payload,&off);
-            uint32_t mv=bee_dal_get_u32(reply->payload,&off);
-            int32_t ma=(int32_t)bee_dal_get_u32(reply->payload,&off);
-            append(info,sizeof(info),&used,"\n%s state=%s voltage=",
-                   bit<limit ? names[bit] : "unknown",
+    else if (type==1 && addr==4 && reply->length>=6 && reply->length<=200 &&
+             reply->payload[1]==2 && reply->length==22U+6U*reply->payload[2] && reply->payload[3]==0) {
+        const uint8_t *p=reply->payload;
+        size_t off=4;uint16_t errors=bee_dal_get_u16(p,&off);
+        append(info,sizeof(info),&used,"report=%u records=%u availability_errors=0x%04x hardware_faults=unavailable",p[0],p[2],errors&7);
+        for (unsigned i=0;i<p[2];i++) {
+            uint16_t d=bee_dal_get_u16(p,&off),mv=bee_dal_get_u16(p,&off);
+            int16_t ma=(int16_t)bee_dal_get_u16(p,&off);unsigned flags=(d>>7)&31;
+            append(info,sizeof(info),&used,"\nboard=%u source=%u flags=0x%02x state=%s voltage=",(d>>4)&7,d&15,flags,
                    !(flags&1) ? "unknown" : (flags&2) ? "on" : "off");
-            if (flags&4) append(info,sizeof(info),&used,"%" PRIu32 " mV",mv);
-            else append(info,sizeof(info),&used,"unavailable");
-            append(info,sizeof(info),&used," current=");
-            if (flags&8) append(info,sizeof(info),&used,"%" PRId32 " mA",ma);
-            else append(info,sizeof(info),&used,"unavailable");
-            if (age!=UINT16_MAX) append(info,sizeof(info),&used," age=%u ms",age);
+            if (flags&4) append(info,sizeof(info),&used,"%u mV",mv);else append(info,sizeof(info),&used,"unavailable");
+            if (flags&8) append(info,sizeof(info),&used," current=%d mA",ma);else append(info,sizeof(info),&used," current=unavailable");
         }
+        size_t tail=reply->length-16U, to=tail;
+        uint16_t valid=bee_dal_get_u16(p,&to), status=bee_dal_get_u16(p,&to);
+        uint8_t mode=p[to++], tps=p[to++];
+        int16_t temp=(int16_t)bee_dal_get_u16(p,&to);
+        uint32_t age=bee_dal_get_u32(p,&to);
+        static const char *const names[]={"UNKNOWN","UNPOWERED","STARTING","READY","COMM_ERROR"};
+        append(info,sizeof(info),&used,"\nPDU valid=0x%04x status=0x%04x mode=%u TPS=%s age_ms=%" PRIu32,
+            valid,status,mode,tps<5?names[tps]:"INVALID",age);
+        if(valid&PDU_VALID_TEMP) append(info,sizeof(info),&used," temperature=%.1f C",temp/10.0);
+
     }
-    else if (type==1 && (addr==0x11 || addr==0x12) && reply->length==8) {
+
+    else if (type==1 && (addr==0x35 || addr==0x31) && reply->length==8) {
         const uint8_t *p=reply->payload;
         uint32_t id=(uint32_t)p[4]|((uint32_t)p[5]<<8)|((uint32_t)p[6]<<16)|((uint32_t)p[7]<<24);
         const char *states[]={"unknown","queued","capturing","saved","failed"};
@@ -1314,7 +1371,7 @@ static void render_reply(const char *command, uint8_t type, uint8_t addr,
             append(info,sizeof(info),&used," path=%s/USB%u_%08" PRIu32 ".jpg",root,p[0]-1,id);
         }
     }
-    else if (type==1 && addr==0x10 && reply->length==32) {
+    else if (type==1 && (addr==0x10 || addr==0x30) && reply->length==32) {
         const uint8_t *p=reply->payload;
         uint16_t mask=(uint16_t)p[2]|((uint16_t)p[3]<<8);
         append(info,sizeof(info),&used,"camera=%u mask=0x%03x",p[0],mask);
@@ -1332,6 +1389,37 @@ static void render_reply(const char *command, uint8_t type, uint8_t addr,
         if (mask&(1U<<9)) append(info,sizeof(info),&used," white_balance=%s",p[26]?"auto":"manual");
         if (mask&(1U<<10)) append(info,sizeof(info),&used," white_balance_temp=%u",(unsigned)p[27]|((unsigned)p[28]<<8));
         if (mask&(1U<<11)) append(info,sizeof(info),&used," brightness=%d",(int16_t)((unsigned)p[29]|((unsigned)p[30]<<8)));
+    }
+    else if (type==1 && addr==5 && reply->length==8) {
+        const uint8_t *p=reply->payload;
+        append(info,sizeof(info),&used,"effective config: BME valid=%u t_os_code=%u p_os_code=%u h_os_code=%u filter_code=%u; IMU valid=%u accel=%u/%u gyro=%u/%u freefall=%u/%u wakeup=%u/%u",
+               !!(p[0]&0x40),p[0]&7,(p[0]>>3)&7,p[1]&7,(p[1]>>3)&7,
+               !!(p[6]&0x20),p[2]&7,(p[2]>>3)&3,p[2]>>5,p[3]&7,p[6]&7,p[4]&63,p[5]&63,p[4]>>6);
+    }
+    else if (type==1 && addr==6 && (reply->length==8 || reply->length==16 ||
+             reply->length==24 || reply->length==10 || reply->length==58)) {
+        static const char *const names[4][11] = {
+            {"OBC_board_cC", "OBC_NTC1_cC", "OBC_NTC2_cC", "OBC_NTC3_cC", "OBC_NTC4_cC",
+             "PDU_board_cC", "EXP_board_cC", "EXP_NTC1_cC", "EXP_NTC2_cC", "EXP_NTC3_cC", "EXP_NTC4_cC"},
+            {"temperature_cC", "pressure_10Pa", "humidity_cPct"},
+            {"temperature_cC", "accel_x_mg", "accel_y_mg", "accel_z_mg", "gyro_x_dps", "gyro_y_dps", "gyro_z_dps"},
+            {"SLF1_flow_uL_min", "SLF1_temperature_cC", "SLF2_flow_uL_min", "SLF2_temperature_cC"}
+        };
+        static const char *const groups[] = {"Temperature", "EXP BME", "EXP IMU", "EXP Flow"};
+        static const unsigned counts[] = {11, 3, 7, 4};
+        unsigned selected = reply->length == 24 ? 0 : reply->length == 8 ? 1 :
+                            reply->length == 16 ? 2 : 3;
+        size_t off = 0;
+        for (unsigned group = 0; group < 4; ++group) {
+            if (reply->length != 58 && group != selected) continue;
+            uint16_t mask = bee_dal_get_u16(reply->payload, &off);
+            append(info,sizeof(info),&used,"%s%s valid_mask=0x%04x",off>2 ? "\n" : "",groups[group],mask);
+            for (unsigned i = 0; i < counts[group]; ++i) {
+                int16_t value = (int16_t)bee_dal_get_u16(reply->payload, &off);
+                if (mask & (1u << i)) append(info,sizeof(info),&used," %s=%d",names[group][i],value);
+                else append(info,sizeof(info),&used," %s=unavailable",names[group][i]);
+            }
+        }
     }
     else if (type==1 && addr==7 && reply->length>=10 &&
              reply->length==10U+12U*reply->payload[4]) {
@@ -1371,7 +1459,7 @@ static void render_reply(const char *command, uint8_t type, uint8_t addr,
         uint32_t hk = bee_dal_get_u32(reply->payload, &off);
         uint32_t sci1 = bee_dal_get_u32(reply->payload, &off);
         uint32_t sci2 = bee_dal_get_u32(reply->payload, &off);
-        append(info, sizeof(info), &used, "logs=%" PRIu32 " images=%" PRIu32 " data=%" PRIu32, hk, sci1, sci2);
+        append(info, sizeof(info), &used, "HK=%" PRIu32 " SCI1=%" PRIu32 " SCI2=%" PRIu32, hk, sci1, sci2);
     }
     else if (type == 3 && addr == 1 && reply->length >= 41) {
         size_t off = 0;
@@ -1416,18 +1504,23 @@ static void render_reply(const char *command, uint8_t type, uint8_t addr,
                    valid & (1U << (i / 4 + 7)) ? "" : " (invalid)");
         }
     }
-    else if (type == 4 && addr == 0 && reply->length == 29) {
+    else if (type == 4 && addr == 0 && reply->length == 57) {
         size_t off = 0;
         uint32_t epoch = bee_dal_get_u32(reply->payload, &off);
         int8_t status = reply->payload[off++];
         uint32_t boot = bee_dal_get_u32(reply->payload, &off);
         append(info, sizeof(info), &used, "epoch=%" PRIu32 " status=%d bootcount=%" PRIu32,
                epoch, status, boot);
-        const char *names[] = {"onboard_temp", "baro_temp", "baro_pressure", "baro_humidity",
-                               "mlx_temp", "mlx_status", "slf_temp", "slf_flow", "rba_status", "ta_status"};
-        for (int i = 0; i < 10; ++i) {
-            uint16_t value = bee_dal_get_u16(reply->payload, &off);
-            append(info, sizeof(info), &used, "\n%s=%d", names[i], (int16_t)value);
+        const char *names[]={"pdu_temp_cC","exp_temp_cC","obc_temp_cC",
+            "ntc0_cC","ntc1_cC","ntc2_cC","ntc3_cC","mlx_avg_cC",
+            "bme_temp_cC","bme_pressure_10Pa","bme_humidity_cPct",
+            "imu_temp_cC","ax_mg","ay_mg","az_mg","gx_dps","gy_dps","gz_dps",
+            "slf1_temp_cC","slf1_flow_uL_min","slf2_temp_cC","slf2_flow_uL_min","rba_status","ta_status"};
+        for(unsigned i=0;i<24;i++) {
+            uint16_t v=bee_dal_get_u16(reply->payload,&off);
+            bool u=i==9 || i==10 || i>=22;
+            if((u && v==UINT16_MAX) || (!u && v==0x8000)) append(info,sizeof(info),&used,"\n%s=unavailable",names[i]);
+            else append(info,sizeof(info),&used,"\n%s=%d",names[i],u ? (int)v : (int)(int16_t)v);
         }
     }
     else if (type==1 && addr==0x14 && reply->length==4) {
@@ -1435,7 +1528,7 @@ static void render_reply(const char *command, uint8_t type, uint8_t addr,
         append(info,sizeof(info),&used,"accepted uptime=%" PRIu32 "s; use thm_stat for applied PWM",
                bee_dal_get_u32(reply->payload,&off));
     }
-    else if (type==1 && addr==0x15 && reply->length==6) {
+    else if (type==1 && addr==0x15 && reply->length==8) {
         for (unsigned i=0;i<6;i++) {
             uint8_t value=reply->payload[i];
             append(info,sizeof(info),&used,"%s%s%u %s duty=%u%%",
@@ -1451,7 +1544,7 @@ static void render_reply(const char *command, uint8_t type, uint8_t addr,
             (p&7u)<7?states[p&7u]:"invalid",p&8u?"yes":"no",p&16u?"yes":"no",
             p&32u?"B":"A",p&64u?"yes":"no",p&128u?"yes":"no");
     }
-    else if (type==2 && addr==0x03 && reply->length==32) {
+    else if (type==2 && (addr==0x03 || addr==0x10) && reply->length==32) {
         const uint8_t *p=reply->payload;
         if (p[1]==0) {
             append(info,sizeof(info),&used,"heater profile=%u main_ntc=%u sec_ntc=%u target_cC=%d delta_cC=%d cutoff_cC=%d timeout_ms=%u resume=%u slew_up=%u slew_down=%u",
@@ -1485,7 +1578,7 @@ static void render_reply(const char *command, uint8_t type, uint8_t addr,
             ir?"ir":"heater",phase<(ir?5u:3u)?(ir?ir_states[phase]:heater_states[phase]):"invalid",
             ir?ir_reasons[reason]:heater_reasons[reason],value&0x40u?"yes":"no",value&0x80u?"yes":"no");
     }
-    else if (((type==1 && addr==0x16) || (type==2 && addr==0x01)) && reply->length==32) {
+    else if (((type==1 && (addr==0x16 || addr==0x36)) || (type==2 && (addr==0x01 || addr==0x12))) && reply->length==32) {
         if (reply->payload[0]==1 && reply->payload[1]==9) {
             static const char *const states[]={"queued","accepted","done","refused",
                 "io_error","power_lost","cancelled","busy","interlocked",
@@ -1511,18 +1604,18 @@ static void render_reply(const char *command, uint8_t type, uint8_t addr,
                 append(info,sizeof(info),&used,"%c",reply->payload[4+i]);
         }
     }
-    else if (type==1 && addr==0x17 && reply->length==4) {
+    else if (type==1 && addr==0x34 && reply->length==4) {
         uint32_t id=(uint32_t)reply->payload[0]|((uint32_t)reply->payload[1]<<8)|
             ((uint32_t)reply->payload[2]<<16)|((uint32_t)reply->payload[3]<<24);
         append(info,sizeof(info),&used,"pump request queued id=%" PRIu32 "; check fld_cfg pump result %" PRIu32,
                id,id);
     }
-    else if (type==1 && addr==0x1a && reply->length==4) {
+    else if (type==1 && addr==0x33 && reply->length==4) {
         uint32_t id=(uint32_t)reply->payload[0]|((uint32_t)reply->payload[1]<<8)|
             ((uint32_t)reply->payload[2]<<16)|((uint32_t)reply->payload[3]<<24);
-        append(info,sizeof(info),&used,"motor request id=%" PRIu32 "; check rba_ctl result %" PRIu32,id,id);
+        append(info,sizeof(info),&used,"motor request id=%" PRIu32 "; check rba_job result %" PRIu32,id,id);
     }
-    else if (type==1 && addr==0x1a && reply->length==12) {
+    else if (type==1 && addr==0x33 && reply->length==12) {
         static const char *const states[]={"queued","accepted","done","invalid","busy",
             "not_ready","refused","not_homed","limit_reached","fault","power_lost",
             "cancelled","storage_error","not_found","limit_invalid","power_off",
@@ -1626,14 +1719,18 @@ static void handle_client(int fd)
     char command[REQUEST_MAX + 1];
     snprintf(command, sizeof(command), "%s", cmd);
     if (!strcmp(cmd, "help")) {
-        const char *help = "ping | sys_info | sys_rtc [epoch|now] | pdu_vout get|set <mV> | pdu_fault_clear\n"
+        const char *help = "ping | sys_info [self_test] | sys_rtc [epoch|now] | pdu_vout get|set <mV> | pdu_fault_clear\n"
                            "pdu_heartbeat get|enable on|off|on <ms>|off <ms> | pdu_bootloader enter\n"
-                           "pwr_en <OBC|EXP|PDU> get | <output> on|off\n"
+                           "pwr_en get|on <global_mask>|off <global_mask> [force] (ICD 01/03)\n"
+                           "pwr_en <OBC|EXP|PDU> get | <output> on|off (DAL extension 01/32)\n"
                            "OBC outputs: AI_power FPGA_power USB1_power USB2_power USB3_power USB4_power MIPI1_power MIPI2_power\n"
                            "EXP outputs: EXP12V SLN_HD MOTOR (force for off)\n"
                            "PDU outputs: VOUT TRANS\n"
                            "For multiple outputs: pwr_en <board> set <select_mask> <on_mask> [force for EXP off]\n"
-                           "pwr_stat <OBC|EXP|PDU> get [source|all|mask <mask>]\n"
+                           "pwr_stat all|monitor|enable|error\n"
+                           "sen_cfg get | sen_cfg set bme <temp_os> <press_os> <hum_os> <filter>\n"
+                           "sen_cfg set imu accel|gyro <odr> <scale> | sen_cfg set imu freefall|wakeup <threshold> <duration>\n"
+                           "sen_stat all|temperature|bme|imu|flow (ICD v1.2)\n"
                            "sen_stat <OBC|EXP|PDU> get <all|temperature|bme|imu|flow|power|camera|limits> [source] [cursor n]\n"
                            "uvc_cfg <1|2|3|4> get|set <setting> <value> [setting value ...]\n"
                            "uvc_ctl <1|2|3|4> capture <request_id> | uvc_stat <1|2|3|4> get <request_id>\n"
@@ -1655,6 +1752,10 @@ static void handle_client(int fd)
                            "fld_ctl valve mask <0-15> | pump <u11|u15> on|off|frequency <Hz>|voltage [channel] <Vpp>\n"
                            "fld_stat [get] (valves and U11/U15 pump actuator state)\n"
                            "rba_ctl init|disable|move <0|1> <steps> [speed]|goto <0|1> <position> [speed]|jog <0|1> <cw|ccw> [speed]|home <0|1>|stop <0|1|all>|stop_hold <0|1>|result <id>\n"
+                           "rba_job <same actions as rba_ctl, including result> (DAL 01/33, returns job IDs)\n"
+                           "fld_job pump <same arguments as fld_ctl> (DAL 01/34, returns job IDs)\n"
+                           "uvc_job <camera> capture <request_id> (DAL 01/35, returns job state)\n"
+                           "uvc_cfg get | uvc_stat | thp_cfg get | thp_en get (native empty GET)\n"
                            "rba_stat [get] (both motors and four optical limits)\n"
                            "tm_get | tm_obc_get\n"
                            "exp_ping | exp_tlm <section> | exp_run <EXP command>\n"
@@ -1664,8 +1765,8 @@ static void handle_client(int fd)
                            "exp_csp_snapshot <0|2|3|6|12>\n"
                            "sen_bme_cfg EXP get|set <temp_os> <press_os> <hum_os> <filter>|result <id>\n"
                            "sen_imu_cfg EXP get|reset|set accel|gyro <odr> <scale>|set freefall|wakeup <threshold> <duration>|result <id>\n"
-                           "dat_lst [mark] | dat_sel <type> <index> <chunk_size> | dat_get <chunk>\n"
-                           "dat_des | dat_del <type> <index> | dat_mark <mark>\n"
+                           "dat_lst <mark> | dat_sel <type> <index> <chunk_size> | dat_get <chunk>\n"
+                           "dat_des | dat_del <type> <index> | dat_mrk <mark> (alias dat_mark)\n"
                            "shell <Linux command> | gui_state | gui_shell <seconds> <command>\n"
                            "port_cfg get|set <KEY> <value>|restart (local console only)\n"
                            "raw <type> <address> [byte ...] | debug_handoff yes\n"

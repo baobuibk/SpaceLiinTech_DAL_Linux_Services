@@ -15,6 +15,7 @@ PROMPT = b"DEBUG@MCU:~ $ "
 def exchange(mode, argument, responder):
     master, slave = pty.openpty()
     commands = []
+    received = threading.Event()
 
     def peer():
         pending = b""
@@ -26,6 +27,9 @@ def exchange(mode, argument, responder):
                     command = raw.decode()
                     commands.append(command)
                     response = responder(command)
+                    received.set()
+                    if response is None:
+                        continue
                     os.write(master, raw + b"\r\n" + response.encode() + b"\r\n" + PROMPT)
         except OSError:
             pass
@@ -37,6 +41,7 @@ def exchange(mode, argument, responder):
                    DAL_EXP_UART_BAUD="115200")
         result = subprocess.run([str(PROBE), mode, argument], env=env,
                                 text=True, capture_output=True, timeout=5, check=True)
+        received.wait(timeout=1)
         return result.stdout, commands
     finally:
         os.close(slave)
@@ -74,6 +79,9 @@ def main():
     assert output.startswith("0\n"), output
     assert "MOTOR0 STOPPED" in output
     assert commands == ["motor5_status all"]
+    output, commands = exchange("run", "reset", lambda _: None)
+    assert output.startswith("0\nEXP reset command sent; reboot not confirmed"), output
+    assert commands == ["reset"], commands  # exactly once; no prompt, no retry
     print("EXP UART command and chunked telemetry: OK")
 
 

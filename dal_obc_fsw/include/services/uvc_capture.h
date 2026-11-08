@@ -7,4 +7,7 @@
 int uvc_capture_queue(uint8_t camera, uint32_t request_id, uint8_t reply[8]);
 int uvc_capture_status(uint8_t camera, uint32_t request_id, uint8_t reply[8]);
 
+/* Three little-endian U16 words: state nibbles, error nibbles, known mask. */
+void uvc_capture_summary(uint8_t reply[6]);
+
 #endif

@@ -24,7 +24,7 @@ content, and the `usb_cam` tool.
 | D4 | PC client `tool/pc_client` has no `thm_*`, `fld_*`, `rba_*` commands. Automation cannot rely on it for those. | `repl.py` command list | Plan uses its own framing library (section 4). |
 | D5 | Error-code split not documented: unknown ADDR under TYPE `01`/`02`/`05` and `04/01` → `0x03`; unknown ADDR under TYPE `00`/`03`/`04`, and unknown TYPE → `0x00`. | `bee_dal_tmtc_service.c:1348-1414` | Document; pinned by T-NEG-*. |
 | D6 | `ping` ignores payload length (any payload is accepted). Not documented. | `handle_ping` | Pinned by T-PING-02. |
-| D7 | `dat_sel`/`dat_get`/`dat_del`/`dat_mark`/`dat_lst` accept **longer** payloads than specified (extra bytes ignored, stderr note); shorter → `0x00`. | `bee_dal_tmtc_service.c:994,1015,1077,1110,1144` | Pinned by T-DAT-*. |
+| D7 | `dat_sel`/`dat_get`/`dat_del`/`dat_mark` historically accepted **longer** payloads than specified (extra bytes ignored, stderr note); shorter → `0x00`. | `bee_dal_tmtc_service.c:994,1015,1077,1110,1144` | Pinned by T-DAT-*. |
 | D8 | **Source and docs moved during the review.** `02/01 pc_cfg` (20:52), `02/02 pc_ctl` (21:11), `02/00 pc_stat` (21:18), `02/03 thp_cfg` (22:09) and `02/04 thp_ctl` (22:21) were added to `dispatch()` and `help` on 2026-10-28. `icd-console-mapping.md` and `icd.md` were updated at 22:10 and now document all five (the 22:22 docs update added `thp_ctl`). `flight-command-register.md` and `flight-software.md` were updated on 2026-10-29: the register now has rows for `01/13`–`01/18`, `01/1A`, `01/1B` and `02/00`–`02/04`, the unsupported paragraph lists `02/05`–`02/09`, and both state the 2000 ms timeout. `test_inv_01` catches the next change of this kind. | `bee_dal_tmtc_service.c` (`handle_pc_*`, `handle_thp_cfg`, `handle_thp_ctl`) | Done; the drift test catches the next addition. |
 | D9 | The HK cache retains the last good sample through read failures until that sample is >30 s old. A stale/missing file therefore does not give `0x01` immediately. Matches the code comment; docs say only "older than 30 s is rejected". | `hk_service.c:poll_snapshot` | Document; pinned by T-TM-03/03b/08. |
 | D10 | **Hazard:** `debug_handoff` runs `systemctl start serial-getty@ttyS1.service` on whatever host runs the daemon. The framework puts a stub `systemctl` first on PATH; never run the daemon with the real one in tests. | `main.c:trigger_debug_getty` | Built into `fsw_auto/fixtures.py`. |
@@ -83,7 +83,7 @@ empty), little-endian fields, 32768-byte payload cap, `0xFE` debug ACK, 41-byte
 | `02/0A` | `exp_ping` | 0 | 3 + text | `00` if len≠0 |
 | `02/0B` | `exp_tlm <section>` | 1–19, no NUL | 3 + JSON | `00` otherwise |
 | `02/0C` | `exp_run <cmd>` (also `sen_bme_cfg`, `sen_imu_cfg` EXP routes) | 1–95, no NUL | 3 + text | `00` otherwise; status byte 0–4 inside payload |
-| `03/00` | `dat_lst [mark]` | 0 or ≥1 | 12 | invalidates selection |
+| `03/00` | `dat_lst <mark>` | exactly 1 | 12 | valid listing invalidates selection; invalid length returns `FF/00` |
 | `03/01` | `dat_sel type idx chunk` | ≥5 | 41 | `00` len<5 or type>2; `01` chunk 0 or >32768, bad index; `03` stale snapshot |
 | `03/02` | `dat_get chunk` | ≥4 | ≤chunk bytes | `00` len<4; `01` not selected or bad chunk; `03` stale |
 | `03/03` | `dat_des` | any | 4 (uptime) | none |
@@ -315,8 +315,8 @@ file; the sim run points the file backend at it with `DAL_DATA_DIR`.
 
 | ID | Case | Expected |
 | --- | --- | --- |
-| T-DAT-01 | `dat_lst` (no mark) | 12 bytes; HK count = fixture; SCI counts = fixture |
-| T-DAT-02 | `dat_lst` with mark filter, with extra bytes | filtered counts; extra ignored (D7) |
+| T-DAT-01 | `dat_lst 0xFF` (all files) | 12 bytes; HK count = fixture; SCI counts = fixture |
+| T-DAT-02 | `dat_lst` with mark filter, with extra bytes | filtered counts; missing/extra bytes rejected with `FF/00`; selection preserved |
 | T-DAT-03 | `dat_sel` HK idx 0, chunk 1024 | 41 bytes; name NUL-padded 20 B; size = file size; CRC32 = `zlib.crc32`; chunks = ceil(size/chunk) (min 1) |
 | T-DAT-04 | full download loop: all chunks, concatenate, CRC32 match, `dat_des` | byte-identical to fixture; last chunk short |
 | T-DAT-05 | chunk sizes 1, 255, 1024, 32768, and 0 / 32769 / 65535 | first four OK; last three `FF/01` |

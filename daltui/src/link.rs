@@ -10,15 +10,21 @@
 use crate::json::Json;
 use crate::proto::{self, Cmd, Decoder, Fed};
 use std::collections::VecDeque;
+#[cfg(unix)]
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_CONSOLE: &str = "/run/dal/dal_obc_fsw/console.sock";
+#[cfg(unix)]
 pub const DEFAULT_RS422: &str = "/run/dal/dal_obc_fsw/rs422.sock";
+
+#[cfg(windows)]
+pub const DEFAULT_RS422: &str = "COM1";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -74,6 +80,15 @@ pub struct Console {
 }
 
 impl Console {
+    #[cfg(not(unix))]
+    fn request(&self, _line: &str, _timeout: Duration) -> Result<String, String> {
+        Err(format!(
+            "Console socket {} requires Linux; use --rs422 COM3 on Windows",
+            self.path
+        ))
+    }
+
+    #[cfg(unix)]
     fn request(&self, line: &str, timeout: Duration) -> Result<String, String> {
         let mut s =
             UnixStream::connect(&self.path).map_err(|e| format!("connect {}: {e}", self.path))?;
@@ -173,21 +188,49 @@ impl Transport for Console {
 // ── RS-422 ────────────────────────────────────────────────────────────────────
 
 enum Port {
+    #[cfg(unix)]
     Sock(UnixStream),
+    #[cfg(unix)]
     Tty(File),
+    #[cfg(windows)]
+    Serial(Box<dyn serialport::SerialPort>),
 }
 
 impl Port {
+    fn is_socket(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self, Port::Sock(_))
+        }
+        #[cfg(windows)]
+        {
+            false
+        }
+    }
     fn write_all(&mut self, b: &[u8]) -> std::io::Result<()> {
         match self {
+            #[cfg(unix)]
             Port::Sock(s) => s.write_all(b),
+            #[cfg(unix)]
             Port::Tty(f) => f.write_all(b),
+            #[cfg(windows)]
+            Port::Serial(s) => {
+                s.set_timeout(Duration::from_secs(5))?;
+                let written = s.write_all(b);
+                let restored = s.set_timeout(Duration::from_millis(200));
+                written?;
+                restored.map_err(Into::into)
+            }
         }
     }
     fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
         match self {
+            #[cfg(unix)]
             Port::Sock(s) => s.read(b),
+            #[cfg(unix)]
             Port::Tty(f) => f.read(b),
+            #[cfg(windows)]
+            Port::Serial(s) => s.read(b),
         }
     }
 }
@@ -207,6 +250,21 @@ impl Rs422 {
         }
     }
 
+    #[cfg(windows)]
+    fn open(&self) -> Result<Port, String> {
+        let name = windows_com_name(&self.path)?;
+        serialport::new(&name, self.baud)
+            .data_bits(serialport::DataBits::Eight)
+            .parity(serialport::Parity::None)
+            .stop_bits(serialport::StopBits::One)
+            .flow_control(serialport::FlowControl::None)
+            .timeout(Duration::from_millis(200))
+            .open()
+            .map(Port::Serial)
+            .map_err(|e| format!("open {name}: {e}; check the adapter and close other programs using this COM port"))
+    }
+
+    #[cfg(unix)]
     fn open(&self) -> Result<Port, String> {
         if self.path.starts_with("/dev/") {
             // Raw 8N1 through stty; VMIN=0 VTIME=2 gives a 200 ms read tick.
@@ -267,9 +325,7 @@ impl Rs422 {
         let mut b = [0u8; 4096];
         while Instant::now() < deadline {
             match port.read(&mut b) {
-                Ok(0) if matches!(port, Port::Sock(_)) => {
-                    return Err("fsw closed the frame socket".into())
-                }
+                Ok(0) if port.is_socket() => return Err("fsw closed the frame socket".into()),
                 Ok(0) => idle += Duration::from_millis(200),
                 Ok(n) => {
                     idle = Duration::ZERO;
@@ -462,5 +518,60 @@ impl Drop for Link {
                 let _ = h.join();
             }
         }
+    }
+}
+
+/// Accept COM1..COM65535 and the Windows device namespace, including COM10+.
+#[cfg(any(windows, test))]
+fn windows_com_name(path: &str) -> Result<String, String> {
+    let name = path.trim().to_ascii_uppercase();
+    let name = name.strip_prefix(r"\\.\").unwrap_or(&name);
+    let number = name
+        .strip_prefix("COM")
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|n| n.parse::<u16>().ok())
+        .filter(|n| *n != 0);
+    number.map(|n| format!("COM{n}")).ok_or_else(|| {
+        "Windows RS-422 requires a COM port, e.g. COM3 (not a Linux /dev path or socket)".into()
+    })
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+    #[test]
+    fn com_names_and_namespace_are_normalized() {
+        for (input, expected) in [
+            ("COM1", "COM1"),
+            ("com3", "COM3"),
+            (r"\\.\COM12", "COM12"),
+            (" COM003 ", "COM3"),
+        ] {
+            assert_eq!(windows_com_name(input).unwrap(), expected);
+        }
+        for input in [
+            "",
+            "COM",
+            "COM0",
+            "COM-1",
+            "COM+1",
+            "COM65536",
+            "COM3x",
+            "/dev/ttyUSB0",
+            "/run/dal/rs422.sock",
+        ] {
+            assert!(windows_com_name(input).is_err(), "{input}");
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn console_socket_has_a_clear_unsupported_error() {
+        let c = Console {
+            path: DEFAULT_CONSOLE.into(),
+        };
+        assert!(c
+            .request("ping", Duration::from_secs(1))
+            .unwrap_err()
+            .contains("requires Linux"));
     }
 }

@@ -34,38 +34,51 @@ TYPE_NAMES = {
     0xFE: "DEBUG_ACK",
 }
 
-DATA_TYPE_NAMES = {0: "LOGS", 1: "IMAGES", 2: "DATA"}
+DATA_TYPE_NAMES = {0: "HK", 1: "SCI1", 2: "SCI2"}
 
-TM_GET_FMT = "<IbIhhHHhHhhHH"
-
+TM_GET_FMT = "<IbI9h2H11h2H"
 TM_GET_LAYOUT = [
-    ("sys_time_epoch", "U32", 4, 5),
-    ("sys_status",     "I8",  1, 9),
-    ("bootcount",       "U32", 4, 10),
-    ("onboard_temp",   "I16", 2, 14),
-    ("baro_temp",      "I16", 2, 16),
-    ("baro_press",     "U16", 2, 18),
-    ("baro_hum",       "U16", 2, 20),
-    ("mlx_temp",       "I16", 2, 22),
-    ("mlx_status",     "U16", 2, 24),
-    ("slf_temp",       "I16", 2, 26),
-    ("slf_flow",       "I16", 2, 28),
-    ("rba_status",     "U16", 2, 30),
-    ("ta_status",      "U16", 2, 32),
+    ('sys_time_epoch', 'U32', 4, 5),
+    ('sys_status', 'I8', 1, 9),
+    ('bootcount', 'U32', 4, 10),
+    ('pdu_temp_cC', 'I16', 2, 14),
+    ('exp_temp_cC', 'I16', 2, 16),
+    ('obc_temp_cC', 'I16', 2, 18),
+    ('ntc0_cC', 'I16', 2, 20),
+    ('ntc1_cC', 'I16', 2, 22),
+    ('ntc2_cC', 'I16', 2, 24),
+    ('ntc3_cC', 'I16', 2, 26),
+    ('mlx_avg_cC', 'I16', 2, 28),
+    ('bme_temp_cC', 'I16', 2, 30),
+    ('bme_pressure_10Pa', 'U16', 2, 32),
+    ('bme_humidity_cPct', 'U16', 2, 34),
+    ('imu_temp_cC', 'I16', 2, 36),
+    ('ax_mg', 'I16', 2, 38),
+    ('ay_mg', 'I16', 2, 40),
+    ('az_mg', 'I16', 2, 42),
+    ('gx_dps', 'I16', 2, 44),
+    ('gy_dps', 'I16', 2, 46),
+    ('gz_dps', 'I16', 2, 48),
+    ('slf1_temp_cC', 'I16', 2, 50),
+    ('slf1_flow_uL_min', 'I16', 2, 52),
+    ('slf2_temp_cC', 'I16', 2, 54),
+    ('slf2_flow_uL_min', 'I16', 2, 56),
+    ('rba_status', 'U16', 2, 58),
+    ('ta_status', 'U16', 2, 60),
 ]
 TM_GET_FIELDS = [row[0] for row in TM_GET_LAYOUT]
-assert struct.calcsize(TM_GET_FMT) == 29, "tm_get payload must be 29 bytes"
-assert sum(row[2] for row in TM_GET_LAYOUT) == 29, "TM_GET_LAYOUT sizes must sum to 29"
+assert struct.calcsize(TM_GET_FMT) == 57
+assert sum(row[2] for row in TM_GET_LAYOUT) == 57
 
 DAT_LST_FMT = "<III"
-DAT_LST_FIELDS = ["logs_count", "images_count", "data_count"]
+DAT_LST_FIELDS = ["hk_count", "sci1_count", "sci2_count"]
 assert struct.calcsize(DAT_LST_FMT) == 12
 
-DAT_LST_TC_FMT = "<B"  # optional mark filter; omit payload entirely = no filter
+DAT_LST_TC_FMT = "<B"  # required mark filter, 255 = all files
 DAT_LST_FILTER_ALL = 0xFF  # no filter, same as omitting the payload
 DAT_LST_FILTER_UNMARKED = 0x00
 
-DAT_SEL_TC_FMT = "<BHH"  # data_type, data_index, chunk_size
+DAT_SEL_TC_FMT = "<BIH"  # data_type, data_index, chunk_size
 DAT_GET_TC_FMT = "<I"    # chunk_index
 DAT_DEL_TC_FMT = "<BI"   # data_type, data_index
 DAT_MARK_TC_FMT = "<B"   # mark
@@ -82,7 +95,7 @@ SYS_INFO_FIELDS = ["hw_version", "fw_version"]
 
 SYS_RTC_TC_FMT = "<I"
 SYS_RTC_TM_FMT = "<I"
-PDU_VOUT_TC_FMT = "<H"
+PDU_VOUT_TC_FMT = "<H6x"
 PDU_VOUT_TM_FMT = "<HHHH"  # setpoint mV, measured mV, measured mA, flags
 
 # Debug shell 

@@ -44,10 +44,16 @@ int main(void)
     assert(bee_dal_files_init(root) == XERR_OK);
     uint32_t snap, logs, images, data;
     assert(bee_dal_files_scan(0xFF, &snap, &logs, &images, &data) == XERR_OK);
-    assert(logs == 3 && images == 3 && data == 2);
+    assert(logs == 1 && images == 3 && data == 2);
     bee_dal_file_entry_t entry;
     assert(bee_dal_files_get_entry(snap, 1, 0, &entry) == XERR_OK);
     assert(strcmp(entry.name, "MIPI1.3_H_000001.png") == 0);
+    assert(bee_dal_files_get_entry(snap, 0, 0, &entry) == XERR_OK);
+    assert(strcmp(entry.name, active) == 0);
+    assert(bee_dal_files_get_entry(snap, 2, 0, &entry) == XERR_OK);
+    assert(strcmp(entry.name, "LWL_00000001.bin") == 0);
+    assert(bee_dal_files_get_entry(snap, 2, 1, &entry) == XERR_OK);
+    assert(strcmp(entry.name, "PC_00000001.bin") == 0);
     uint8_t chunk[32]; uint16_t length = 0;
     assert(bee_dal_files_read_chunk(snap, 1, 0, 0, sizeof(chunk), chunk, &length) == XERR_OK);
     assert(length == 4 && !memcmp(chunk, "png\n", 4));

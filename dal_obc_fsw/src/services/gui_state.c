@@ -30,6 +30,8 @@ typedef struct {
     time_t stamp;
     int temp_tenth;
     unsigned mode, flags;
+    uint16_t valid;
+    uint8_t tps_state;
     bool vout, trans;
     unsigned set_mv, vout_mv, vout_ma, trans_mv, trans_ma, in12_mv, in5_mv;
 } pdu_t;
@@ -42,6 +44,12 @@ static uint32_t g_pdu_build;
 static time_t g_pdu_version_stamp;
 static atomic_bool g_pdu_running;
 static int poll_pdu(pdu_t *result);
+static uint64_t tps_started_ms;
+static bool tps_was_on;
+static uint64_t monotonic_ms(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    return (uint64_t)t.tv_sec*1000U+(uint64_t)t.tv_nsec/1000000U;
+}
 
 static void store_pdu(const pdu_t *sample)
 {
@@ -120,7 +128,16 @@ static int modbus_read(int fd, uint8_t unit, uint8_t func, uint16_t offset,
     tcflush(fd,TCIFLUSH);
     if (write(fd,req,sizeof(req))!=(ssize_t)sizeof(req) || tcdrain(fd)!=0) return -1;
     uint8_t reply[64];
-    if (read_exact(fd,reply,3)!=0 || reply[0]!=unit || reply[1]!=func) return -1;
+    if (read_exact(fd,reply,3)!=0 || reply[0]!=unit) {
+        fprintf(stderr,"[PDU] Modbus read failed: FC=%u offset=%u count=%u header/timeout\n",func,offset,count);
+        return -1;
+    }
+    if(reply[1]==(uint8_t)(func|0x80)) {
+        if(read_exact(fd,reply+3,2)==0 && crc16(reply,3)==(uint16_t)(reply[3]|reply[4]<<8))
+            fprintf(stderr,"[PDU] Modbus exception: FC=%u offset=%u count=%u exception=0x%02X\n",func,offset,count,reply[2]);
+        return -1;
+    }
+    if(reply[1]!=func) return -1;
     size_t bytes=reply[2], expected=func<=2 ? (count+7)/8 : count*2;
     if (bytes!=expected || bytes+5>sizeof(reply) || read_exact(fd,reply+3,bytes+2)!=0) return -1;
     crc=crc16(reply,bytes+3);
@@ -190,7 +207,7 @@ static int open_pdu(void)
     struct termios term;
     if (tcgetattr(fd,&term)!=0) {close(fd);return -1;}
     cfmakeraw(&term);cfsetispeed(&term,B115200);cfsetospeed(&term,B115200);
-    term.c_cflag=(term.c_cflag&~(PARENB|CSTOPB|CSIZE))|CS8|CLOCAL|CREAD;
+    term.c_cflag=(term.c_cflag&~(PARENB|CSTOPB|CSIZE|CRTSCTS))|CS8|CLOCAL|CREAD;
     term.c_cc[VMIN]=0;term.c_cc[VTIME]=1;
     if (tcsetattr(fd,TCSANOW,&term)!=0) {close(fd);return -1;}
     return fd;
@@ -248,6 +265,7 @@ int gui_pdu_vout(bool set, uint16_t target_mv, gui_pdu_vout_t *result)
             .current_ma=(uint16_t)sample.vout_ma,
             .flags=(uint16_t)((sample.trans ? GUI_PDU_VOUT_TRANS_ON : 0) |
                 (sample.vout ? GUI_PDU_VOUT_ENABLED : 0) |
+                ((sample.valid&PDU_VALID_VOUT) ? GUI_PDU_VOUT_STATE_VALID : 0) |
                 (sample.set_mv!=UINT16_MAX ? GUI_PDU_VOUT_SET_VALID : 0) |
                 (sample.vout_mv!=UINT16_MAX ? GUI_PDU_VOUT_VOLT_VALID : 0) |
                 (sample.vout_ma!=UINT16_MAX ? GUI_PDU_VOUT_CURR_VALID : 0))
@@ -269,7 +287,7 @@ int gui_pdu_vout(bool set, uint16_t target_mv, gui_pdu_vout_t *result)
             result->voltage_mv=input[1];
             result->current_ma=input[2];
             result->flags=(uint16_t)((trans[0] ? GUI_PDU_VOUT_TRANS_ON : 0U) |
-                (vout[0] ? GUI_PDU_VOUT_ENABLED : 0U) |
+                GUI_PDU_VOUT_STATE_VALID | (vout[0] ? GUI_PDU_VOUT_ENABLED : 0U) |
                 (input[0]!=0xffff ? GUI_PDU_VOUT_SET_VALID : 0U) |
                 (input[1]!=0xffff ? GUI_PDU_VOUT_VOLT_VALID : 0U) |
                 (input[2]!=0xffff ? GUI_PDU_VOUT_CURR_VALID : 0U));
@@ -294,7 +312,8 @@ int gui_pdu_power(uint16_t select, uint16_t on, uint16_t *state,
     if (!select) {
         pdu_t sample;
         if (cached_pdu(&sample) != 0) return -1;
-        *known = 3U;
+        *known = ((sample.valid&PDU_VALID_VOUT) ? 1U : 0U) |
+                 ((sample.valid&PDU_VALID_TRANS) ? 2U : 0U);
         *state = (uint16_t)((sample.vout ? 1U : 0U) |
                             (sample.trans ? 2U : 0U));
         return 0;
@@ -306,7 +325,7 @@ int gui_pdu_power(uint16_t select, uint16_t on, uint16_t *state,
         pthread_mutex_unlock(&g_pdu_io_lock);
         return -1;
     }
-    uint16_t identity[2], coils[2];
+    uint16_t identity[2];
     bool valid=modbus_read(fd,(uint8_t)unit,3,99,2,identity)==0 &&
         identity[0]==0x5044 && identity[1]==0x5500;
     if (valid && select) {
@@ -319,17 +338,22 @@ int gui_pdu_power(uint16_t select, uint16_t on, uint16_t *state,
         if ((select & 2U) && !(on & 2U) &&
             modbus_write_coil(fd,(uint8_t)unit,1,false)!=0) *failed|=2U;
     }
-    if (valid && modbus_read(fd,(uint8_t)unit,1,0,2,coils)==0) {
-        *known=3U;
-        *state=(uint16_t)((coils[0] ? 1U : 0U) | (coils[1] ? 2U : 0U));
-    }
     close(fd);
     pthread_mutex_unlock(&g_pdu_io_lock);
     pdu_t sample;
-    if (valid && poll_pdu(&sample) == 0) store_pdu(&sample);
-    else { memset(&sample, 0, sizeof(sample)); store_pdu(&sample); }
+    if (valid && poll_pdu(&sample) == 0) {
+        store_pdu(&sample);
+        *known=((sample.valid&PDU_VALID_VOUT) ? 1U : 0U) |
+               ((sample.valid&PDU_VALID_TRANS) ? 2U : 0U);
+        *state=(sample.vout ? 1U : 0U)|(sample.trans ? 2U : 0U);
+        /* Confirmed TRANS OFF physically guarantees VOUT de-energized after an OFF request. */
+        if ((select&1U) && !(on&1U) && (sample.valid&PDU_VALID_TRANS) && !sample.trans)
+            *failed&=(uint16_t)~1U;
+    } else { memset(&sample,0,sizeof(sample));store_pdu(&sample); }
     if (!valid) return -1;
-    *failed|=(uint16_t)(select & ~*known);
+    uint16_t unconfirmed=(uint16_t)(select & ~*known);
+    if ((select&1U) && !(on&1U) && (*known&2U) && !(*state&2U)) unconfirmed&=(uint16_t)~1U;
+    *failed|=unconfirmed;
     *failed|=(uint16_t)(select & *known & (*state ^ on));
     return *known ? 0 : -1;
 }
@@ -406,33 +430,67 @@ int gui_pdu_enter_bootloader(void)
 }
 static int poll_pdu(pdu_t *result)
 {
+    memset(result,0,sizeof(*result));
+    result->temp_tenth=(int16_t)0x8000;
+    result->set_mv=result->vout_mv=result->vout_ma=result->trans_mv=
+        result->trans_ma=result->in12_mv=result->in5_mv=UINT16_MAX;
     pthread_mutex_lock(&g_pdu_io_lock);
     int fd=open_pdu(), unit=pdu_unit();
     if (fd<0 || unit<0) {if (fd>=0) close(fd);pthread_mutex_unlock(&g_pdu_io_lock);return -1;}
-    uint16_t input[12],coil[2],discrete[1];
-    int ok=modbus_read(fd,unit,4,19,12,input)==0 &&
-           modbus_read(fd,unit,1,0,2,coil)==0 &&
-           modbus_read(fd,unit,2,10,1,discrete)==0;
-    close(fd);
-    pthread_mutex_unlock(&g_pdu_io_lock);
-    if (!ok) return -1;
-    memset(result,0,sizeof(*result));
+    uint16_t input[12],trans[1],vout[1];
+    bool got_input=modbus_read(fd,unit,4,19,12,input)==0;
+    if (got_input) {
+        result->valid=PDU_VALID_FLAGS|PDU_VALID_MODE|PDU_VALID_TRANS|PDU_VALID_RAILS;
+        result->flags=input[0];result->mode=input[2];
+        result->trans=(input[0]&2U)!=0;
+        result->temp_tenth=(int16_t)input[1];
+        if (input[1]!=0x8000) result->valid|=PDU_VALID_TEMP;
+        result->set_mv=input[3];
+        if (input[3]!=UINT16_MAX) result->valid|=PDU_VALID_SETPOINT;
+        result->vout_mv=input[4];result->vout_ma=input[5];
+        result->in12_mv=input[6];result->trans_mv=input[8];
+        result->trans_ma=input[9];result->in5_mv=input[10];
+    }
+    /* TRANS feedback does not require access to the unpowered TPS. */
+    if (modbus_read(fd,unit,2,10,1,trans)==0) {
+        result->trans=trans[0]!=0;result->valid|=PDU_VALID_TRANS;
+    }
+    uint64_t now=monotonic_ms();
+    if (result->valid&PDU_VALID_TRANS) {
+        if (!result->trans) {
+            result->tps_state=PDU_TPS_UNPOWERED;
+            result->valid&=(uint16_t)~PDU_VALID_SETPOINT;
+            result->set_mv=UINT16_MAX;
+            tps_was_on=false;
+            /* No FC01 request to coil 1 while TPS is unpowered. */
+        } else {
+            if (!tps_was_on) {tps_started_ms=now;tps_was_on=true;}
+            if (modbus_read(fd,unit,1,0,1,vout)==0) {
+                result->vout=vout[0]!=0;result->valid|=PDU_VALID_VOUT;
+                result->tps_state=PDU_TPS_READY;
+            } else result->tps_state=now-tps_started_ms<2000U ?
+                PDU_TPS_STARTING : PDU_TPS_COMM_ERROR;
+        }
+    } else tps_was_on=false;
+    if(result->tps_state!=PDU_TPS_READY) {
+        result->valid&=(uint16_t)~PDU_VALID_SETPOINT;result->set_mv=UINT16_MAX;
+    }
+    close(fd);pthread_mutex_unlock(&g_pdu_io_lock);
+    if (!result->valid) return -1;
     result->online=true;result->stamp=time(NULL);
-    result->temp_tenth=input[1]==0x8000 ? 0x8000 : (int16_t)input[1];
-    result->mode=input[2];result->flags=input[0];
-    result->vout=coil[0]!=0;
-    result->trans=discrete[0]!=0;
-    result->set_mv=input[3];result->vout_mv=input[4];result->vout_ma=input[5];
-    result->in12_mv=input[6];result->trans_mv=input[8];result->trans_ma=input[9];
-    result->in5_mv=input[10];
     return 0;
 }
+
 int gui_pdu_status(gui_pdu_status_t *result)
 {
     if (!result) return -1;
     pdu_t sample={0};
     if (cached_pdu(&sample)!=0) return -1;
     *result=(gui_pdu_status_t){
+        .valid=sample.valid, .status_flags=(uint16_t)sample.flags,
+        .mode=(uint8_t)sample.mode, .tps_state=sample.tps_state,
+        .age_ms=(uint32_t)(time(NULL)-sample.stamp)*1000U,
+        .setpoint_mv=(uint16_t)sample.set_mv,
         .vout_mv=(uint16_t)sample.vout_mv, .vout_ma=(uint16_t)sample.vout_ma,
         .trans_mv=(uint16_t)sample.trans_mv, .trans_ma=(uint16_t)sample.trans_ma,
         .input_12v_mv=(uint16_t)sample.in12_mv, .input_5v_mv=(uint16_t)sample.in5_mv,
@@ -502,10 +560,10 @@ size_t gui_state_json(char *out, size_t capacity)
     if (pdu.online && time(NULL)-pdu.stamp<=15) {
         const char *modes[]={"NORMAL","MANUAL","WARNING","ERROR"};
         add(out,capacity,&used,"{\"board\":\"pdu\",\"schema_version\":1,\"obc_timestamp\":%ld,",(long)pdu.stamp);
-        if (pdu.temp_tenth==0x8000) add(out,capacity,&used,"\"board_temp_c\":null,");
+        if (!(pdu.valid&PDU_VALID_TEMP)) add(out,capacity,&used,"\"board_temp_c\":null,");
         else add(out,capacity,&used,"\"board_temp_c\":%.1f,",pdu.temp_tenth/10.0);
-        add(out,capacity,&used,"\"mode\":\"%s\",\"status_flags\":%u,\"vout_on\":%s,\"trans_on\":%s,",
-            pdu.mode<4?modes[pdu.mode]:"UNKNOWN",pdu.flags,pdu.vout?"true":"false",pdu.trans?"true":"false");
+        add(out,capacity,&used,"\"valid_mask\":%u,\"tps_state\":%u,\"mode\":\"%s\",\"status_flags\":%u,\"vout_on\":%s,\"trans_on\":%s,",
+            pdu.valid,pdu.tps_state,(pdu.valid&PDU_VALID_MODE) && pdu.mode<4?modes[pdu.mode]:"UNKNOWN",pdu.flags,(pdu.valid&PDU_VALID_VOUT) ? (pdu.vout?"true":"false") : "null",(pdu.valid&PDU_VALID_TRANS) ? (pdu.trans?"true":"false") : "null");
         add(out,capacity,&used,"\"vout_set_mv\":%u,\"vout_mv\":%u,\"vout_ma\":%u,\"trans_mv\":%u,\"trans_ma\":%u,\"input_12v_mv\":%u,\"input_5v_mv\":%u}",
             pdu.set_mv,pdu.vout_mv,pdu.vout_ma,pdu.trans_mv,pdu.trans_ma,pdu.in12_mv,pdu.in5_mv);
     } else add(out,capacity,&used,"null");

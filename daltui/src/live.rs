@@ -243,20 +243,20 @@ impl Live {
 /// One telemetry round. The first column names the UI field family it feeds.
 fn poll_set() -> Vec<Cmd> {
     vec![
-        proto::ping(),               // OBC uptime
-        proto::sys_info(),           // board online flags and versions
-        proto::sys_rtc_get(),        // RTC
-        proto::tm_obc_get(),         // OBC onboard temp, NTC1-4, BME688, PAC U6/U2
-        proto::pwr_stat(Board::Obc), // eFuse, USB and MIPI switch states
-        proto::pwr_stat(Board::Pdu), // VOUT, TRANS, input rails
-        proto::pdu_vout_get(),       // VOUT setpoint
-        proto::pdu_heartbeat_get(),  // heartbeat enable and on/off periods
-        proto::pwr_stat(Board::Exp), // EXP switches and PAC rails
-        proto::thm_stat(),           // heaters and IR LEDs
-        proto::exp_csp_snapshot(3),  // four heater profiles from FSW housekeeping cache
-        proto::fld_stat(),           // pump U11 / U15
-        proto::rba_stat(),           // DRV8910 and motors
-        proto::pc_stat(),            // PC experiment
+        proto::ping(),                     // OBC uptime
+        proto::sys_info(),                 // board online flags and versions
+        proto::sys_rtc_get(),              // RTC
+        proto::tm_obc_get(),               // OBC onboard temp, NTC1-4, BME688, PAC U6/U2
+        proto::pwr_stat(),                 // aggregate OBC / EXP / PDU power status
+        proto::pdu_vout_get(),             // VOUT setpoint
+        proto::pdu_heartbeat_get(),        // heartbeat enable and on/off periods
+        proto::thm_stat(),                 // heaters and IR LEDs
+        proto::exp_csp_snapshot(3),        // four heater profiles from FSW housekeeping cache
+        proto::fld_stat(),                 // pump U11 / U15
+        proto::rba_stat(),                 // DRV8910 and motors
+        proto::pc_stat(),                  // PC experiment
+        proto::exp_run("camera_status 0"), // cached autonomous thermal samples (no capture)
+        proto::exp_run("camera_status 1"),
     ]
 }
 
@@ -281,6 +281,9 @@ impl Sim {
         e.ir_status_seen = [false; 2];
         e.ir_applied = [None; 2];
         for c in &mut e.camera {
+            c.monitor = None;
+            c.monitor_enabled = None;
+            c.monitor_running = false;
             c.confirmed = false;
             c.buffer_enabled = None;
             c.initialized = false;
@@ -304,6 +307,9 @@ impl Sim {
         e.burn_status_seen = [false; 2];
         e.faults.clear();
         let p = &mut self.pdu;
+        p.status = None;
+        p.poll_age = f64::NAN;
+        p.power_valid = [[false; 2]; 4];
         p.online = false;
         p.temp = f32::NAN;
         p.boot_cause = "n/a";
@@ -319,6 +325,9 @@ impl Sim {
     /// Live-mode replacement for the physics step.
     pub fn live_tick(&mut self, dt: f64) {
         self.t += dt;
+        if self.pdu.poll_age.is_finite() {
+            self.pdu.poll_age += dt;
+        }
         if self.exp.ht_status_at.is_some_and(|at| self.t - at > 3.0) {
             self.exp.ht_status_seen = [false; 4];
         }
@@ -376,13 +385,26 @@ impl Sim {
                 if let Some(since) = self.live.cam_wait[camera] {
                     if self.t - since > 30.0 {
                         self.live.cam_wait[camera] = None;
-                        self.exp.camera[camera].result = "timeout waiting for capture".into();
+                        self.exp.camera[camera].result =
+                            "timeout waiting for camera operation".into();
                     } else {
                         self.live.send(
                             proto::exp_run(&format!("camera_status {camera}")),
                             Why::Action("exp.cam_status".into()),
                         );
                     }
+                }
+            }
+            for camera in 0..2 {
+                let c = &self.exp.camera[camera];
+                if c.monitor_enabled == Some(false)
+                    && c.monitor_running
+                    && self.live.cam_wait[camera].is_none()
+                {
+                    self.live.send(
+                        proto::exp_run(&format!("camera_status {camera}")),
+                        Why::Action("exp.cam_status".into()),
+                    );
                 }
             }
             let mut check_download = false;
@@ -574,11 +596,23 @@ impl Sim {
                 let sub = sub_of(id);
                 if matches!(
                     id,
-                    "exp.cam_capture" | "exp.cam_init" | "exp.cam_detect" | "exp.cam_address_set"
+                    "exp.cam_capture"
+                        | "exp.cam_init"
+                        | "exp.cam_detect"
+                        | "exp.cam_address_set"
+                        | "exp.cam_temp"
                 ) {
                     let camera = self.exp.cam_sel;
                     self.live.cam_wait[camera] = Some(self.t);
                     self.exp.camera[camera].result = "request queued".into();
+                    if id == "exp.cam_temp" {
+                        let c = &mut self.exp.camera[camera];
+                        c.temp_centi = None;
+                        c.mean_centi = None;
+                        c.point_max_centi = None;
+                        c.point_request_id = 0;
+                        c.point_coords = Some((c.x, c.y, c.delta));
+                    }
                     if id == "exp.cam_capture" {
                         self.exp.camera[camera].temp_centi = None;
                         self.exp.camera[camera].mean_centi = None;
@@ -628,6 +662,7 @@ impl Sim {
                     "obc.led_pwm"
                         | "obc.mipi_route"
                         | "obc.mipi_capture"
+                        | "exp.reset"
                         | "exp.burn_arm"
                         | "exp.burn"
                         | "exp.burn_abort"
@@ -643,6 +678,7 @@ impl Sim {
                         | "exp.mmap_read"
                 ) && !id.starts_with("exp.pc_")
                     && !id.starts_with("exp.ht_")
+                    && !id.starts_with("exp.sensor_")
                 {
                     for c in refresh_after(sub) {
                         self.live.send(c, Why::Refresh);
@@ -650,6 +686,12 @@ impl Sim {
                 }
                 if matches!(id, "exp.ht_manual_set" | "exp.ht_manual_off") {
                     self.live.send(proto::thm_stat(), Why::Refresh);
+                }
+                if matches!(id, "exp.cam_monitor_start" | "exp.cam_monitor_stop") {
+                    self.live.send(
+                        proto::exp_run(&format!("camera_status {}", self.exp.cam_sel)),
+                        Why::Action("exp.cam_status".into()),
+                    );
                 }
                 if id == "exp.cam_apply" {
                     self.live.send(
@@ -710,7 +752,6 @@ fn sub_of(id: &str) -> Sub {
 pub fn unwired(id: &str) -> Option<&'static str> {
     match id {
         "obc.reboot" => Some("The flight software has no reboot command."),
-        "exp.reset" => Some("No wired flight command yet for EXP reset."),
         "pdu.vout_en" | "pdu.trans_en" | "pdu.vout_set" | "pdu.fault_clear" | "pdu.heartbeat"
         | "pdu.led_on" | "pdu.led_off" | "pdu.bootloader" => None,
         _ if id.starts_with("pdu.") => Some("PDU register not exposed by the flight software."),
@@ -728,6 +769,9 @@ pub fn unwired_in(mode: Mode, id: &str) -> Option<&'static str> {
 
 /// Selectors and staged values only edit the draft; the matching Set action sends them.
 fn is_local(id: &str) -> bool {
+    if crate::controls::sensor_field(id).is_some() {
+        return true;
+    }
     if let Some((_, field)) = crate::controls::ir_field(id) {
         return matches!(field, "max" | "duty" | "pwm" | "time");
     }
@@ -829,16 +873,16 @@ fn is_local(id: &str) -> bool {
 
 fn refresh_after(sub: Sub) -> Vec<Cmd> {
     match sub {
-        Sub::Obc => vec![proto::pwr_stat(Board::Obc)],
+        Sub::Obc => vec![proto::pwr_stat()],
         Sub::Exp => vec![
-            proto::pwr_stat(Board::Exp),
+            proto::pwr_stat(),
             proto::thm_stat(),
             proto::fld_stat(),
             proto::rba_stat(),
             proto::pc_stat(),
         ],
         Sub::Pdu => vec![
-            proto::pwr_stat(Board::Pdu),
+            proto::pwr_stat(),
             proto::pdu_vout_get(),
             proto::pdu_heartbeat_get(),
         ],
@@ -918,6 +962,9 @@ fn sync_pc_field(exp: &mut crate::sim::Exp, target: usize, index: usize, value: 
 
 /// Control id + action -> flight commands. `Err` explains why nothing is sent.
 pub fn plan(s: &mut Sim, id: &str, act: &Act) -> Result<Vec<Cmd>, String> {
+    if id.starts_with("obc.dat_") {
+        return s.transfer.plan(id);
+    }
     if let Some((i, field)) = crate::controls::ir_field(id) {
         let c = s.exp.ir_setup[i];
         let command = match field {
@@ -959,6 +1006,15 @@ pub fn plan(s: &mut Sim, id: &str, act: &Act) -> Result<Vec<Cmd>, String> {
     let one = |c: Cmd| Ok(vec![c]);
     let exp = |t: String| Ok(vec![proto::exp_run(&t)]);
     match id {
+        "exp.reset" => one(proto::exp_run("reset")),
+        "exp.sensor_get" => one(proto::sen_cfg_get()),
+        "exp.sensor_bme_read" => one(proto::sen_stat(false)),
+        "exp.sensor_imu_read" => one(proto::sen_stat(true)),
+        "exp.sensor_set_bme" => one(proto::sen_cfg_set(&e.sensor_draft, 0)),
+        "exp.sensor_set_accel" => one(proto::sen_cfg_set(&e.sensor_draft, 1)),
+        "exp.sensor_set_gyro" => one(proto::sen_cfg_set(&e.sensor_draft, 2)),
+        "exp.sensor_set_freefall" => one(proto::sen_cfg_set(&e.sensor_draft, 3)),
+        "exp.sensor_set_wakeup" => one(proto::sen_cfg_set(&e.sensor_draft, 4)),
         "exp.cam_apply" => {
             let c = &e.camera[e.cam_sel];
             exp(format!(
@@ -979,19 +1035,17 @@ pub fn plan(s: &mut Sim, id: &str, act: &Act) -> Result<Vec<Cmd>, String> {
         )),
         "exp.cam_detect" => exp(format!("camera_detect {}", e.cam_sel)),
         "exp.cam_init" => exp(format!("camera_init {}", e.cam_sel)),
+        "exp.cam_monitor_start" => exp(format!("camera_monitor {} 1", e.cam_sel)),
+        "exp.cam_monitor_stop" => exp(format!("camera_monitor {} 0", e.cam_sel)),
         "exp.cam_capture" => exp(format!("camera_capture {}", e.cam_sel)),
         "exp.cam_status" => exp(format!("camera_status {}", e.cam_sel)),
-        "exp.cam_temp" | "exp.cam_mean" => {
+        "exp.cam_temp" => {
             let c = &e.camera[e.cam_sel];
-            let (x, y, w, h) = c.point_region().ok_or("invalid point measurement region")?;
+            c.point_region()
+                .ok_or("invalid point coordinates or delta")?;
             exp(format!(
-                "camera_temp {} {} {} {} {}{}",
-                e.cam_sel,
-                x,
-                y,
-                w,
-                h,
-                if id == "exp.cam_mean" { " mean" } else { "" }
+                "camera_point {} {} {} {}",
+                e.cam_sel, c.x, c.y, c.delta
             ))
         }
         // OBC power switches: pwr_en OBC <output> on|off (TYPE 01 / ADDR 03)
@@ -1672,11 +1726,11 @@ mod pump_type_tests {
         sim.exp.u11.freq_staged = 240;
         assert_eq!(
             plan(&mut sim, "exp.pc_manual_pump_freq_set", &Act::Run).unwrap()[0].text,
-            "fld_ctl pump u11 frequency 240"
+            "fld_job pump u11 frequency 240"
         );
         assert_eq!(
             plan(&mut sim, "exp.pc_manual_pump_on", &Act::Run).unwrap()[0].text,
-            "fld_ctl pump u11 on"
+            "fld_job pump u11 on"
         );
         let pump = proto::fld_pump(1, 1, 0, 0);
         let reply = Reply {
@@ -1885,14 +1939,31 @@ fn apply_camera_reply(s: &mut Sim, command: &str, text: &str) {
     };
     if matches!(
         op,
-        "camera_capture" | "camera_init" | "camera_detect" | "camera_address_set"
+        "camera_capture" | "camera_init" | "camera_detect" | "camera_address_set" | "camera_point"
     ) {
         if let Some(line) = text.lines().find(|line| line.starts_with("CAMERA camera=")) {
             if let Some(result) = status_word(line, "result") {
                 s.exp.camera[camera].result = result.into();
+                if op == "camera_point" && result == "QUEUED" {
+                    s.exp.camera[camera].point_request_id =
+                        status_u32(line, "request").unwrap_or(0);
+                }
                 if result != "QUEUED" {
                     s.live.cam_wait[camera] = None;
                 }
+            }
+        }
+    } else if op == "camera_monitor" {
+        if let Some(line) = text
+            .lines()
+            .find(|l| l.starts_with("CAMERA_MONITOR_CONTROL "))
+        {
+            if status_u32(line, "camera") == Some(camera as u32)
+                && status_word(line, "result") == Some("OK")
+            {
+                s.exp.camera[camera].monitor_enabled =
+                    status_value(line, "enabled").map(|v| v != 0);
+                s.exp.camera[camera].monitor_running = status_value(line, "running") == Some(1);
             }
         }
     } else if op == "camera_config" {
@@ -1933,10 +2004,6 @@ fn apply_camera_reply(s: &mut Sim, command: &str, text: &str) {
             c.data_exist = v != 0;
         }
         if let Some(v) = status_u32(line, "request") {
-            if c.request_id != v {
-                c.temp_centi = None;
-                c.mean_centi = None;
-            }
             c.request_id = v;
         }
         if let Some(v) = status_u32(line, "object") {
@@ -1945,22 +2012,81 @@ fn apply_camera_reply(s: &mut Sim, command: &str, text: &str) {
             }
             c.object_id = v;
         }
-        c.peak = text
+        let monitor_line = text.lines().find(|l| {
+            l.starts_with("CAMERA_MONITOR ") && status_u32(l, "camera") == Some(camera as u32)
+        });
+        c.monitor_enabled = monitor_line
+            .and_then(|l| status_value(l, "enabled"))
+            .map(|v| v != 0);
+        c.monitor_running = monitor_line.and_then(|l| status_value(l, "running")) == Some(1);
+        c.monitor = text
             .lines()
-            .find(|l| l.starts_with("CAMERA_PEAK "))
+            .find(|l| l.starts_with("CAMERA_MONITOR "))
             .and_then(|l| {
-                if status_value(l, "valid") != Some(1)
-                    || status_u32(l, "request") != Some(c.request_id)
-                {
+                if status_u32(l, "camera") != Some(camera as u32) {
                     return None;
                 }
-                let x = status_value(l, "x")?;
-                let y = status_value(l, "y")?;
-                if !(0..32).contains(&x) || !(0..24).contains(&y) {
+                let x = status_u32(l, "x")?;
+                let y = status_u32(l, "y")?;
+                if x >= 32 || y >= 24 {
                     return None;
                 }
-                Some((status_value(l, "max_cC")?, x as u8, y as u8))
+                Some(crate::sim::CameraMonitor {
+                    valid: status_value(l, "valid")? == 1,
+                    error: status_value(l, "error")?,
+                    sequence: status_u32(l, "seq")?,
+                    max_centi: status_value(l, "max_cC")?,
+                    mean_centi: status_value(l, "mean_cC")?,
+                    x: x as u8,
+                    y: y as u8,
+                })
             });
+        if let Some(stats) = text.lines().find(|l| {
+            l.starts_with("CAMERA_STATS ")
+                && status_u32(l, "camera") == Some(camera as u32)
+                && status_value(l, "valid") == Some(1)
+        }) {
+            if let (Some(max), Some(mean), Some(x), Some(y)) = (
+                status_value(stats, "max_cC"),
+                status_value(stats, "mean_cC"),
+                status_u32(stats, "x"),
+                status_u32(stats, "y"),
+            ) {
+                if x < 32 && y < 24 {
+                    c.peak = Some((max, x as u8, y as u8));
+                    c.frame_mean_centi = Some(mean);
+                }
+            }
+        }
+        if let Some(point) = text.lines().find(|l| {
+            l.starts_with("CAMERA_POINT ")
+                && status_u32(l, "camera") == Some(camera as u32)
+                && status_value(l, "valid") == Some(1)
+        }) {
+            if let (Some(id), Some(x), Some(y), Some(delta), Some(center), Some(max), Some(mean)) = (
+                status_u32(point, "request"),
+                status_value(point, "x"),
+                status_value(point, "y"),
+                status_value(point, "delta"),
+                status_value(point, "center_cC"),
+                status_value(point, "max_cC"),
+                status_value(point, "mean_cC"),
+            ) {
+                if id > 0
+                    && (c.point_request_id == 0 || c.point_request_id == id)
+                    && (0..32).contains(&x)
+                    && (0..24).contains(&y)
+                    && (0..32).contains(&delta)
+                {
+                    c.point_request_id = id;
+                    c.point_coords = Some((x, y, delta));
+                    c.temp_centi = Some(center);
+                    c.point_max_centi = Some(max);
+                    c.mean_centi = Some(mean);
+                    c.sample_ms = status_u32(point, "sample_ms").unwrap_or(0);
+                }
+            }
+        }
         if let Some(v) = status_word(line, "result") {
             c.result = v.into();
             if !matches!(v, "QUEUED" | "RUNNING") {
@@ -1970,31 +2096,6 @@ fn apply_camera_reply(s: &mut Sim, command: &str, text: &str) {
                 }
             }
         }
-    } else if op == "camera_temp" {
-        if let Some(line) = text.lines().find(|line| line.starts_with("CAMERA_TEMP ")) {
-            let c = &mut s.exp.camera[camera];
-            if status_u32(line, "request") != Some(c.request_id) {
-                return;
-            }
-            let region: Vec<i32> = command
-                .split_whitespace()
-                .skip(3)
-                .take(4)
-                .filter_map(|v| v.parse().ok())
-                .collect();
-            let Some((x, y, w, h)) = c.point_region() else {
-                return;
-            };
-            if region != [x, y, w, h] {
-                return;
-            }
-            if command.ends_with(" mean") {
-                c.mean_centi = status_value(line, "mean_cC");
-            } else {
-                c.temp_centi = status_value(line, "max_cC");
-            }
-            c.sample_ms = status_u32(line, "sample_ms").unwrap_or(0);
-        }
     }
 }
 
@@ -2003,37 +2104,111 @@ mod ir_camera_tests {
     use super::*;
 
     #[test]
-    fn capture_peak_and_point_average_remain_separate() {
+    fn monitor_samples_are_separate_and_missing_or_invalid_replies_clear_them() {
+        let mut s = Sim::new();
+        s.t = 20.0;
+        let base = "CAMERA camera=0 initialized=1 request=9 op=2 result=OK object=7\nCAMERA_STATS camera=0 request=9 valid=1 max_cC=3000 mean_cC=2600 x=31 y=23 sample_ms=100\n";
+        let monitor = "CAMERA_MONITOR camera=0 valid=1 running=0 seq=5 max_cC=3250 mean_cC=2510 x=10 y=12 sample_ms=18000 age_ms=2000 error=0 period_ms=2000";
+        apply_camera_reply(
+            &mut s,
+            "exp_run camera_status 0",
+            &format!("{base}{monitor}"),
+        );
+        let m = s.exp.camera[0].monitor.as_ref().unwrap();
+        assert!(m.valid);
+        assert_eq!((m.max_centi, m.mean_centi, m.x, m.y), (3250, 2510, 10, 12));
+        assert_eq!(m.sequence, 5);
+        assert_eq!(s.exp.camera[0].peak, Some((3000, 31, 23)));
+        assert_eq!(s.exp.camera[0].object_id, 7);
+        apply_camera_reply(
+            &mut s,
+            "exp_run camera_status 0",
+            &format!(
+                "{base}{}",
+                monitor
+                    .replace("valid=1", "valid=0")
+                    .replace("error=0", "error=-12")
+            ),
+        );
+        let m = s.exp.camera[0].monitor.as_ref().unwrap();
+        assert!(!m.valid);
+        assert_eq!(m.error, -12);
+        apply_camera_reply(
+            &mut s,
+            "exp_run camera_status 0",
+            &format!("{base}{}", monitor.replace("x=10", "x=32")),
+        );
+        assert!(s.exp.camera[0].monitor.is_none());
+        apply_camera_reply(&mut s, "exp_run camera_status 0", base); // old firmware
+        assert!(s.exp.camera[0].monitor.is_none());
+    }
+
+    #[test]
+    fn monitor_controls_target_selected_camera_and_wait_for_confirmation() {
+        let mut s = Sim::new();
+        s.exp.cam_sel = 1;
+        assert_eq!(
+            plan(&mut s, "exp.cam_monitor_start", &Act::Run).unwrap()[0].text,
+            "exp_run camera_monitor 1 1"
+        );
+        assert_eq!(
+            plan(&mut s, "exp.cam_monitor_stop", &Act::Run).unwrap()[0].text,
+            "exp_run camera_monitor 1 0"
+        );
+        assert_eq!(s.exp.camera[1].monitor_enabled, None);
+        apply_camera_reply(
+            &mut s,
+            "exp_run camera_monitor 1 1",
+            "CAMERA_MONITOR_CONTROL camera=1 enabled=1 running=0 result=OK",
+        );
+        assert_eq!(s.exp.camera[1].monitor_enabled, Some(true));
+        assert_eq!(s.exp.camera[0].monitor_enabled, None);
+        apply_camera_reply(
+            &mut s,
+            "exp_run camera_monitor 1 0",
+            "CAMERA_MONITOR_CONTROL camera=1 enabled=0 running=1 result=OK",
+        );
+        assert_eq!(s.exp.camera[1].monitor_enabled, Some(false));
+        assert!(s.exp.camera[1].monitor_running);
+        apply_camera_reply(
+            &mut s,
+            "exp_run camera_monitor 1 1",
+            "CAMERA_MONITOR_CONTROL camera=1 enabled=1 running=0 result=NOT_INITIALIZED",
+        );
+        assert_eq!(s.exp.camera[1].monitor_enabled, Some(false));
+        apply_camera_reply(&mut s, "exp_run camera_status 1", "CAMERA camera=1 initialized=1 request=0 result=OK\nCAMERA_MONITOR camera=1 valid=0 running=0 enabled=0 seq=0 max_cC=0 mean_cC=0 x=0 y=0 error=0");
+        assert!(!s.exp.camera[1].monitor_running);
+        assert_eq!(s.exp.camera[1].monitor_enabled, Some(false));
+    }
+
+    #[test]
+    fn fresh_point_result_is_distinct_from_frame_statistics_and_saved_image() {
         let mut s = Sim::new();
         apply_camera_reply(&mut s, "exp_run camera_status 0",
-            "CAMERA camera=0 initialized=1 request=9 op=2 result=OK object=7\nCAMERA_PEAK camera=0 request=9 valid=1 max_cC=3000 x=31 y=23 sample_ms=100");
-        assert_eq!(s.exp.camera[0].peak, Some((3000, 31, 23)));
+            "CAMERA camera=0 initialized=1 request=9 op=2 result=OK object=7\nCAMERA_STATS camera=0 request=9 valid=1 max_cC=3000 mean_cC=2600 x=31 y=23 sample_ms=100");
         s.exp.camera[0].x = 10;
         s.exp.camera[0].y = 10;
         s.exp.camera[0].delta = 2;
-        let command = plan(&mut s, "exp.cam_mean", &Act::Run).unwrap()[0]
+        let command = plan(&mut s, "exp.cam_temp", &Act::Run).unwrap()[0]
             .text
             .clone();
-        assert_eq!(command, "exp_run camera_temp 0 8 8 5 5 mean");
-        apply_camera_reply(
-            &mut s,
-            &command,
-            "CAMERA_TEMP camera=0 request=9 roi=8,8,5,5 max_cC=2800 mean_cC=2500 sample_ms=100",
-        );
-        assert_eq!(s.exp.camera[0].mean_centi, Some(2500));
-        assert_eq!(s.exp.camera[0].temp_centi, None);
-        assert_eq!(s.exp.camera[0].peak, Some((3000, 31, 23)));
-        s.exp.camera[0].mean_centi = None;
-        s.exp.camera[0].delta = 0;
-        apply_camera_reply(
-            &mut s,
-            &command,
-            "CAMERA_TEMP camera=0 request=9 mean_cC=2500 sample_ms=100",
-        );
-        assert_eq!(s.exp.camera[0].mean_centi, None);
+        assert_eq!(command, "exp_run camera_point 0 10 10 2");
+        apply_camera_reply(&mut s, &command, "CAMERA camera=0 request=10 result=QUEUED");
+        assert_eq!(s.exp.camera[0].point_request_id, 10);
         apply_camera_reply(&mut s, "exp_run camera_status 0",
-            "CAMERA camera=0 initialized=1 request=10 op=2 result=RUNNING object=7\nCAMERA_PEAK camera=0 request=10 valid=0");
-        assert_eq!(s.exp.camera[0].peak, None);
+            "CAMERA camera=0 initialized=1 request=10 op=5 result=OK object=7\nCAMERA_STATS camera=0 valid=1 request=10 max_cC=3100 mean_cC=2700 x=31 y=0 sample_ms=200\nCAMERA_POINT camera=0 request=10 valid=1 x=10 y=10 delta=2 center_cC=2400 max_cC=2800 mean_cC=2500 sample_ms=200 error=0");
+        let c = &s.exp.camera[0];
+        assert_eq!(c.temp_centi, Some(2400));
+        assert_eq!(c.point_max_centi, Some(2800));
+        assert_eq!(c.mean_centi, Some(2500));
+        assert_eq!(c.frame_mean_centi, Some(2700));
+        assert_eq!(c.peak, Some((3100, 31, 0)));
+        assert_eq!(c.point_coords, Some((10, 10, 2)));
+        assert_eq!(c.object_id, 7);
+        // A late result from an older measurement cannot replace request 10.
+        apply_camera_reply(&mut s, "exp_run camera_status 0",
+            "CAMERA camera=0 initialized=1 request=10 op=5 result=OK object=7\nCAMERA_POINT camera=0 request=9 valid=1 x=0 y=0 delta=0 center_cC=1111 max_cC=1111 mean_cC=1111 sample_ms=100 error=0");
+        assert_eq!(s.exp.camera[0].temp_centi, Some(2400));
     }
 
     #[test]
@@ -2054,7 +2229,7 @@ mod ir_camera_tests {
     }
 
     #[test]
-    fn camera_commands_and_roi_measurement_use_exp_gateway() {
+    fn camera_commands_and_fresh_point_measurement_use_exp_gateway() {
         let mut s = Sim::new();
         s.exp.cam_sel = 1;
         let cfg = plan(&mut s, "exp.cam_apply", &Act::Run).unwrap();
@@ -2072,7 +2247,7 @@ mod ir_camera_tests {
         );
         assert_eq!(
             plan(&mut s, "exp.cam_temp", &Act::Run).unwrap()[0].text,
-            "exp_run camera_temp 1 0 0 1 1"
+            "exp_run camera_point 1 0 0 0"
         );
         s.exp.camera[1].x = 32;
         assert!(plan(&mut s, "exp.cam_temp", &Act::Run).is_err());
@@ -2092,9 +2267,11 @@ mod ir_camera_tests {
         assert!(s.live.cam_wait[0].is_none());
         apply_camera_reply(
             &mut s,
-            "exp_run camera_temp 0 0 0 1 1",
-            "CAMERA_TEMP camera=0 request=41 roi=0,0,32,24 max_cC=2534 sample_ms=4294967294",
+            "exp_run camera_point 0 0 0 0",
+            "CAMERA camera=0 request=42 result=QUEUED",
         );
+        apply_camera_reply(&mut s, "exp_run camera_status 0",
+            "CAMERA camera=0 initialized=1 request=42 op=5 result=OK object=9\nCAMERA_POINT camera=0 request=42 valid=1 x=0 y=0 delta=0 center_cC=2534 max_cC=2534 mean_cC=2534 sample_ms=4294967294 error=0");
         assert_eq!(s.exp.camera[0].temp_centi, Some(2534));
         assert_eq!(s.exp.camera[0].sample_ms, 4294967294);
     }
@@ -2423,6 +2600,16 @@ fn apply_inventory_snapshot(s: &mut Sim, payload: &[u8]) -> Result<String, Strin
 
 /// Decode one reply into the model. Returns a one-line summary for the history.
 fn decode(s: &mut Sim, cmd: &Cmd, r: &Reply) -> (Level, String) {
+    if cmd.ty == 3 {
+        return (
+            if s.transfer.status.starts_with("Error:") {
+                Level::Err
+            } else {
+                Level::Info
+            },
+            s.transfer.status.clone(),
+        );
+    }
     let p = &r.payload;
     let bad = |what: &str| {
         (
@@ -2442,7 +2629,7 @@ fn decode(s: &mut Sim, cmd: &Cmd, r: &Reply) -> (Level, String) {
             Ok(summary) => (Level::Info, summary),
             Err(reason) => (Level::Warn, reason),
         },
-        (1, 0x10) if p.len() == 32 && (1..=4).contains(&p[0]) => {
+        (1, 0x10 | 0x30) if p.len() == 32 && (1..=4).contains(&p[0]) => {
             let cam = (p[0] - 1) as usize;
             s.obc.usb_led_pwm[cam] = if p[3] & 0x10 != 0 { p[31] as i32 } else { 0 };
             (
@@ -2513,80 +2700,151 @@ fn decode(s: &mut Sim, cmd: &Cmd, r: &Reply) -> (Level, String) {
             }
             None => bad("tm_obc_get"),
         },
-        (1, 4) => match proto::dec_pwr_stat(p) {
-            Some((Board::Obc, _, recs)) => {
-                let st = |bit: u8| recs.iter().find(|x| x.bit == bit).map_or(false, |x| x.on);
-                let o = &mut s.obc;
-                o.ai_efuse = st(8);
-                o.fpga_efuse = st(9);
-                for i in 0..4 {
-                    o.usb[i] = st(10 + i as u8);
-                }
-                o.mipi = [st(14), st(15)];
+        (1, 5) => match proto::dec_sen_cfg(p) {
+            Some(value) => {
+                s.exp.sensor_actual = Some(value);
                 (
                     Level::Info,
                     format!(
-                        "AI {} FPGA {} USB {}{}{}{} MIPI {}{}",
-                        st(8) as u8,
-                        st(9) as u8,
-                        st(10) as u8,
-                        st(11) as u8,
-                        st(12) as u8,
-                        st(13) as u8,
-                        st(14) as u8,
-                        st(15) as u8
+                        "Sensor config: BME valid={}, IMU valid={}",
+                        value.1[0], value.1[1]
                     ),
                 )
             }
-            Some((Board::Exp, _, recs)) => {
-                for x in &recs {
-                    let (mv, ma) = (x.mv.map(|v| v as i64), x.ma.map(|v| v as i64));
-                    match x.bit {
-                        0..=3 => rail_set(&mut s.exp.pac[x.bit as usize], mv, ma),
-                        4 => s.exp.exp12v = x.on,
-                        5 => s.exp.sln = x.on,
-                        6 => s.exp.motor = x.on,
-                        _ => {}
-                    }
-                }
-                let e = &s.exp;
-                (
-                    Level::Info,
-                    format!(
-                        "EXP12V {} SLN_HD {} MOTOR {}",
-                        e.exp12v as u8, e.sln as u8, e.motor as u8
-                    ),
-                )
-            }
-            Some((Board::Pdu, _, recs)) => {
-                for x in &recs {
-                    let (mv, ma) = (x.mv.map(|v| v as i64), x.ma.map(|v| v as i64));
-                    match x.bit {
-                        0 => {
-                            s.pdu.vout_en = x.on;
-                            rail_set(&mut s.pdu.rails[0], mv, ma);
-                        }
-                        1 => {
-                            s.pdu.trans_en = x.on;
-                            rail_set(&mut s.pdu.rails[2], mv, ma);
-                        }
-                        2 => rail_set(&mut s.pdu.rails[1], mv, ma),
-                        3 => rail_set(&mut s.pdu.rails[3], mv, ma),
-                        _ => {}
-                    }
-                }
-                s.pdu.poll_age = 0.0;
-                (
-                    Level::Info,
-                    format!(
-                        "VOUT {} TRANS {}",
-                        s.pdu.vout_en as u8, s.pdu.trans_en as u8
-                    ),
-                )
-            }
-            None => bad("pwr_stat"),
+            None => bad("sen_cfg"),
         },
-        (1, 3) => match proto::dec_pwr_en(p) {
+        (1, 6) => match proto::dec_sen_stat(p) {
+            Some(values) => {
+                let i = if values.len() == 3 { 0 } else { 1 };
+                s.exp.sensor_readings[i] = Some(values);
+                (Level::Info, "Sensor status updated".into())
+            }
+            None => bad("sen_stat"),
+        },
+        (1, 4) => {
+            s.pdu.status = None;
+            s.pdu.power_valid = [[false; 2]; 4];
+            s.pdu.online = false;
+            s.pdu.temp = f32::NAN;
+            s.pdu.poll_age = f64::NAN;
+            let Some(status) = proto::dec_pdu_status(p) else {
+                return bad("pwr_stat PDU status");
+            };
+            // Validate all source records before applying any PDU state.
+            if proto::dec_pwr_stat(p, Board::Pdu).is_none() {
+                return bad("pwr_stat");
+            }
+            s.pdu.status = Some(status);
+            s.pdu.online = status.valid != 0;
+            s.pdu.temp = if status.valid & 4 != 0 {
+                status.temp as f32 / 10.0
+            } else {
+                f32::NAN
+            };
+            if status.valid & 2 != 0 {
+                s.pdu.mode = status.mode as usize;
+            }
+            if status.valid & 1 != 0 {
+                s.pdu.led_state = status.flags & 1 != 0;
+                s.pdu.trans_fault = status.flags & 4 != 0;
+                s.pdu.mcu_fault = status.flags & 8 != 0;
+                s.pdu.latched = status.flags & 0x30 != 0;
+            }
+            if status.valid & 32 != 0 {
+                s.pdu.vout_set = status.setpoint as i32;
+            }
+            s.pdu.poll_age = if status.age_ms == u32::MAX {
+                f64::NAN
+            } else {
+                status.age_ms as f64 / 1000.0
+            };
+            let mut result = (Level::Info, String::new());
+            for board in [Board::Obc, Board::Exp, Board::Pdu] {
+                result = match proto::dec_pwr_stat(p, board) {
+                    Some((Board::Obc, _, recs)) => {
+                        for x in &recs {
+                            if !x.state_known {
+                                continue;
+                            }
+                            match x.bit {
+                                8 => s.obc.ai_efuse = x.on,
+                                9 => s.obc.fpga_efuse = x.on,
+                                10..=13 => s.obc.usb[(x.bit - 10) as usize] = x.on,
+                                14..=15 => s.obc.mipi[(x.bit - 14) as usize] = x.on,
+                                _ => {}
+                            }
+                        }
+                        (
+                            Level::Info,
+                            format!("OBC power: {} source records", recs.len()),
+                        )
+                    }
+                    Some((Board::Exp, _, recs)) => {
+                        for x in &recs {
+                            let (mv, ma) = (x.mv.map(|v| v as i64), x.ma.map(|v| v as i64));
+                            match x.bit {
+                                0..=3 => rail_set(&mut s.exp.pac[x.bit as usize], mv, ma),
+                                4 if x.state_known => s.exp.exp12v = x.on,
+                                5 if x.state_known => s.exp.sln = x.on,
+                                6 if x.state_known => s.exp.motor = x.on,
+                                _ => {}
+                            }
+                        }
+                        let e = &s.exp;
+                        (
+                            Level::Info,
+                            format!(
+                                "EXP12V {} SLN_HD {} MOTOR {}",
+                                e.exp12v as u8, e.sln as u8, e.motor as u8
+                            ),
+                        )
+                    }
+                    Some((Board::Pdu, _, recs)) => {
+                        for x in &recs {
+                            let (mv, ma) = (x.mv.map(|v| v as i64), x.ma.map(|v| v as i64));
+                            match x.bit {
+                                0 => {
+                                    s.pdu.power_valid[0] = [x.mv.is_some(), x.ma.is_some()];
+                                    if x.state_known {
+                                        s.pdu.vout_en = x.on;
+                                    }
+                                    rail_set(&mut s.pdu.rails[0], mv, ma);
+                                }
+                                1 => {
+                                    s.pdu.power_valid[2] = [x.mv.is_some(), x.ma.is_some()];
+                                    if x.state_known {
+                                        s.pdu.trans_en = x.on;
+                                    }
+                                    rail_set(&mut s.pdu.rails[2], mv, ma);
+                                }
+                                2 => {
+                                    s.pdu.power_valid[1] = [x.mv.is_some(), x.ma.is_some()];
+                                    rail_set(&mut s.pdu.rails[1], mv, ma);
+                                }
+                                3 => {
+                                    s.pdu.power_valid[3] = [x.mv.is_some(), x.ma.is_some()];
+                                    rail_set(&mut s.pdu.rails[3], mv, ma);
+                                }
+                                _ => {}
+                            }
+                        }
+                        (
+                            Level::Info,
+                            format!(
+                                "VOUT {} TRANS {}",
+                                s.pdu.vout_en as u8, s.pdu.trans_en as u8
+                            ),
+                        )
+                    }
+                    None => bad("pwr_stat"),
+                };
+                if result.0 == Level::Err {
+                    break;
+                }
+            }
+            result
+        }
+        (1, 0x32) => match proto::dec_pwr_en(p) {
             Some((b, on, known, failed)) => {
                 if b == Board::Exp as u8 {
                     if known & 1 != 0 {
@@ -2612,7 +2870,9 @@ fn decode(s: &mut Sim, cmd: &Cmd, r: &Reply) -> (Level, String) {
                 if let Some(sp) = v.set_mv {
                     s.pdu.vout_set = sp as i32;
                 }
-                s.pdu.vout_en = v.vout_on;
+                if v.vout_known {
+                    s.pdu.vout_en = v.vout_on;
+                }
                 s.pdu.trans_en = v.trans_on;
                 (
                     Level::Info,
@@ -2657,7 +2917,7 @@ fn decode(s: &mut Sim, cmd: &Cmd, r: &Reply) -> (Level, String) {
             (Level::Info, "heater limits read from EXP".into())
         }
         (1, 0x14) if p.len() == 4 => (Level::Ok, "heater manual command accepted".into()),
-        (2, 0x03) if p.len() == 32 && p[1] == 0 && p[2] < 4 => {
+        (2, 0x03 | 0x10) if p.len() == 32 && p[1] == 0 && p[2] < 4 => {
             let i = p[2] as usize;
             let hp = &mut s.exp.ht_profile[i];
             hp.main_ntc = p[3] as usize;
@@ -2837,7 +3097,7 @@ fn decode(s: &mut Sim, cmd: &Cmd, r: &Reply) -> (Level, String) {
             }
             None => bad("pc_stat"),
         },
-        (1, 0x11) | (1, 0x12) => match proto::dec_uvc(p) {
+        (1, 0x35) | (1, 0x31) => match proto::dec_uvc(p) {
             Some((cam, st, err, id)) => {
                 let c = (cam as usize).saturating_sub(1).min(3);
                 let sh = &mut s.obc.usb_shot[c];
@@ -2920,7 +3180,7 @@ fn decode(s: &mut Sim, cmd: &Cmd, r: &Reply) -> (Level, String) {
             }
             None => (Level::Ok, "configuration accepted".into()),
         },
-        (1, 0x17) => match proto::dec_req_id(p) {
+        (1, 0x34) => match proto::dec_req_id(p) {
             Some(id) => {
                 if let Some(&unit) = cmd.payload.first() {
                     if unit == 1 || unit == 2 {
@@ -2931,7 +3191,7 @@ fn decode(s: &mut Sim, cmd: &Cmd, r: &Reply) -> (Level, String) {
             }
             None => (Level::Ok, "accepted".into()),
         },
-        (1, 0x1A) => match proto::dec_req_id(p) {
+        (1, 0x33) => match proto::dec_req_id(p) {
             Some(id) => (Level::Ok, format!("motor request id {id}")),
             None => (Level::Ok, format!("motor reply ({} bytes)", p.len())),
         },
@@ -3103,7 +3363,7 @@ mod heater_reply_tests {
         let mut reply = Reply {
             ack: 1,
             code: 0x15,
-            payload: vec![0; 6],
+            payload: vec![0; 8],
             text: String::new(),
             ok: true,
             tx: String::new(),
@@ -3252,12 +3512,12 @@ mod exp_config_command_tests {
         );
         assert_eq!(
             plan(&mut sim, "exp.mstop", &Act::Run).unwrap()[0].text,
-            "rba_ctl stop_hold 1"
+            "rba_job stop_hold 1"
         );
         sim.exp.motors[1].holding = true;
         assert_eq!(
             plan(&mut sim, "exp.mstop", &Act::Run).unwrap()[0].text,
-            "rba_ctl stop 1"
+            "rba_job stop 1"
         );
         sim.exp.motors[1].holding = false;
         sim.exp.msps = 500;
@@ -3523,7 +3783,7 @@ fn apply_state(s: &mut Sim, j: &Json) {
         };
     }
     let pdu = j.get("pdu");
-    if !pdu.is_null() {
+    if !pdu.is_null() && s.pdu.status.is_none() {
         if let Some(t) = pdu.get("board_temp_c").f64() {
             s.pdu.temp = t as f32;
         }
@@ -3585,6 +3845,9 @@ pub fn apply(s: &mut Sim, d: Done) {
     };
     match d.result {
         Err(e) => {
+            if cmd.ty == 3 {
+                s.transfer.fail(&e);
+            }
             if matches!(&d.why, Why::Action(id) if matches!(id.as_str(), "exp.cam_capture" | "exp.cam_init" | "exp.cam_detect" | "exp.cam_address_set"))
             {
                 let camera = cmd
@@ -3666,6 +3929,20 @@ pub fn apply(s: &mut Sim, d: Done) {
             } else if cmd.text == "port_cfg restart" && r.ok {
                 s.live.port_restart_pending = false;
             }
+            if cmd.ty == 3 {
+                let outcome = if r.is_err() || !r.ok {
+                    Err(format!("Flight error 0x{:02X}", r.code))
+                } else if r.ack != 3 || r.code != cmd.addr {
+                    Err("Unexpected data-transfer reply".into())
+                } else {
+                    s.transfer.reply(&cmd, &r.payload)
+                };
+                match outcome {
+                    Ok(Some(next)) => s.live.send(next, Why::Action("obc.dat_download".into())),
+                    Ok(None) => {}
+                    Err(e) => s.transfer.fail(&e),
+                }
+            }
             let mut mcu_error = false;
             let (mut lvl, mut summary) = if r.is_err() {
                 (Level::Err, format!("flight error 0x{:02X}", r.code))
@@ -3686,6 +3963,34 @@ pub fn apply(s: &mut Sim, d: Done) {
                 summary.push_str(
                     "; MCU refused manual heater control: check profile ownership and heater limits",
                 );
+            }
+            if !r.is_err() && cmd.text == "exp_run reset" {
+                if let Some((0, _)) = proto::dec_exp_text(&r.payload) {
+                    lvl = Level::Info;
+                    summary =
+                        "EXP reset command sent; reboot not confirmed. Read status after startup."
+                            .into();
+                    s.exp.sensor_actual = None;
+                    s.exp.sensor_readings = [None, None];
+                    s.live.cam_wait = [None; 2];
+                    s.live.cam_download_wait = [None; 2];
+                    for camera in &mut s.exp.camera {
+                        camera.initialized = false;
+                        camera.confirmed = false;
+                        camera.buffer_enabled = None;
+                        camera.monitor = None;
+                        camera.monitor_enabled = None;
+                        camera.monitor_running = false;
+                        camera.peak = None;
+                        camera.temp_centi = None;
+                        camera.mean_centi = None;
+                        camera.point_max_centi = None;
+                        camera.point_request_id = 0;
+                        camera.point_coords = None;
+                        camera.frame_mean_centi = None;
+                        camera.result = "reset sent; read status".into();
+                    }
+                }
             }
             if !r.is_err() && cmd.text == "exp_run pc_status" {
                 if let Some((0, report)) = proto::dec_exp_text(&r.payload) {
@@ -3907,6 +4212,8 @@ pub fn apply(s: &mut Sim, d: Done) {
                     }
                     if !text.contains("ERROR") {
                         apply_motor_settings(s, &cmd.text, &text);
+                    }
+                    if !text.contains("ERROR") || cmd.text.starts_with("exp_run camera_status ") {
                         apply_camera_reply(s, &cmd.text, &text);
                     }
                     if cmd.text.starts_with("exp_run burn_arm ") && text.contains("OK armed") {
@@ -4040,7 +4347,7 @@ pub fn apply(s: &mut Sim, d: Done) {
                     match id.as_str() {
                         "exp.pc_datalog" => s.exp.pc_datalog = cmd.payload.get(4) == Some(&1),
                         "exp.pc_resume" => s.exp.pc_resume = cmd.payload.get(4) == Some(&1),
-                        "exp.mstop" | "exp.mstop_op" if (cmd.ty, cmd.addr) == (1, 0x1A) => {
+                        "exp.mstop" | "exp.mstop_op" if (cmd.ty, cmd.addr) == (1, 0x33) => {
                             if let (Some(&op), Some(&motor)) =
                                 (cmd.payload.first(), cmd.payload.get(1))
                             {
@@ -4202,6 +4509,10 @@ fn note_link_error(s: &mut Sim, what: &str, e: &str) {
     s.obc.fsw_up = false;
     s.exp.link = false;
     s.pdu.online = false;
+    s.pdu.status = None;
+    s.pdu.power_valid = [[false; 2]; 4];
+    s.pdu.temp = f32::NAN;
+    s.pdu.poll_age = f64::NAN;
 }
 
 pub fn default_target(mode: Mode) -> String {
@@ -4350,5 +4661,118 @@ mod pc_panel_tests {
         s.exp.pc_target = 1;
         s.set_num("exp.pc_pump_freq", 2_000);
         assert!(plan(&mut s, "exp.pc_profile_apply", &Act::Run).is_err());
+    }
+}
+
+#[cfg(test)]
+mod exp_reset_tests {
+    use super::*;
+    #[test]
+    fn reset_is_wired_to_exp_gateway_for_both_live_transports() {
+        for mode in [Mode::Console, Mode::Rs422] {
+            let mut s = Sim::new();
+            s.live.mode = mode;
+            assert!(unwired_in(mode, "exp.reset").is_none());
+            let commands = plan(&mut s, "exp.reset", &Act::Run).unwrap();
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0].text, "exp_run reset");
+            assert_eq!((commands[0].ty, commands[0].addr), (2, 0x0c));
+            assert_eq!(commands[0].payload, b"reset");
+        }
+    }
+}
+
+#[cfg(test)]
+mod sensor_action_tests {
+    use super::*;
+    #[test]
+    fn edits_stay_local_and_set_targets_only_one_sensor() {
+        let mut s = Sim::new();
+        assert!(is_local("exp.sensor_filter"));
+        s.set_idx("exp.sensor_filter", 7);
+        assert!(s.exp.sensor_actual.is_none());
+        let commands = plan(&mut s, "exp.sensor_set_bme", &Act::Run).unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].payload, vec![1, 0, 2, 3, 1, 7, 0, 0]);
+        assert_eq!(
+            plan(&mut s, "exp.sensor_get", &Act::Run).unwrap()[0]
+                .payload
+                .len(),
+            0
+        );
+        assert_eq!(
+            plan(&mut s, "exp.sensor_imu_read", &Act::Run).unwrap()[0].payload,
+            vec![3]
+        );
+    }
+}
+
+#[cfg(test)]
+mod pdu_status_tests {
+    use super::*;
+    fn reply(valid: u16, tps: u8, age: u32) -> Reply {
+        let mut p = vec![0, 2, 4, 0, 0, 128];
+        for i in 0..4u16 {
+            let f = if valid == 0 {
+                0
+            } else if i == 0 {
+                0x1c
+            } else if i == 1 {
+                0x1d
+            } else {
+                0x14
+            };
+            p.extend_from_slice(&(i | 5 << 4 | f << 7).to_le_bytes());
+            p.extend_from_slice(&12000u16.to_le_bytes());
+            p.extend_from_slice(&10i16.to_le_bytes());
+        }
+        p.extend_from_slice(&valid.to_le_bytes());
+        p.extend_from_slice(&0u16.to_le_bytes());
+        p.extend_from_slice(&[2, tps]);
+        p.extend_from_slice(&251i16.to_le_bytes());
+        p.extend_from_slice(&age.to_le_bytes());
+        p.extend_from_slice(&12000u16.to_le_bytes());
+        p.extend_from_slice(&0u16.to_le_bytes());
+        Reply {
+            ack: 1,
+            code: 4,
+            payload: p,
+            text: String::new(),
+            ok: true,
+            tx: String::new(),
+            rx: String::new(),
+            ms: 1,
+        }
+    }
+    #[test]
+    fn rs422_applies_pdu_temperature_mode_and_validity() {
+        let mut s = Sim::new();
+        s.live.mode = Mode::Rs422;
+        let r = reply(1 | 2 | 4 | 8 | 64, 1, 3000);
+        assert_ne!(decode(&mut s, &proto::pwr_stat(), &r).0, Level::Err);
+        assert!(s.pdu.online);
+        assert_eq!(s.pdu.temp, 25.1);
+        assert_eq!(s.pdu.mode, 2);
+        assert_eq!(s.pdu.status.unwrap().tps, 1);
+        assert_eq!(s.pdu.poll_age, 3.0);
+        assert!(s.pdu.power_valid[0][0]);
+        assert!(!s.pdu.power_valid[1][1]);
+        let r = reply(0, 0, u32::MAX);
+        decode(&mut s, &proto::pwr_stat(), &r);
+        assert!(!s.pdu.online);
+        assert!(s.pdu.temp.is_nan());
+        assert!(s.pdu.poll_age.is_nan());
+        assert_eq!(s.pdu.power_valid, [[false; 2]; 4]);
+    }
+    #[test]
+    fn old_payload_and_invalid_trailer_are_rejected() {
+        let mut s = Sim::new();
+        let mut r = reply(0, 0, u32::MAX);
+        r.payload[1] = 1;
+        assert_eq!(decode(&mut s, &proto::pwr_stat(), &r).0, Level::Err);
+        r.payload[1] = 2;
+        let n = r.payload.len();
+        r.payload[n - 1] = 1;
+        assert_eq!(decode(&mut s, &proto::pwr_stat(), &r).0, Level::Err);
     }
 }

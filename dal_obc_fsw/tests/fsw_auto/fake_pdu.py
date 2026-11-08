@@ -32,6 +32,8 @@ class FakePdu:
 
     def reset(self):
         with self.lock:
+            self.fail_tps_read = False
+            self.fail_input_read = False
             self.setpoint = 0xFFFF          # "none commanded since reset"
             self.vout_en = self.trans_en = False
             self.temp_tenth = 251
@@ -78,6 +80,10 @@ class FakePdu:
         with self.lock:
             self.requests.append((func, offset, value))
             ok = lambda body: body + crc16(body).to_bytes(2, "little")
+            if func==1 and offset==0 and self.fail_tps_read:
+                return self._exception(func,4)
+            if func==4 and self.fail_input_read:
+                return self._exception(func,4)
             if func in (1, 2):
                 coils = {0: self.vout_en, 1: self.trans_en, 2: self.latched_fault,
                          9: self.heartbeat_enabled}

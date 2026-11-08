@@ -212,9 +212,9 @@ pub struct State {
     /// Current page per subsystem.
     pub page: [usize; 3],
     /// Selected control per subsystem and page (index into `Sub::controls`).
-    pub sel: [[usize; 9]; 3],
+    pub sel: [[usize; 10]; 3],
     /// Last selected control in each of the two visible control panels.
-    pub panel_sel: [[[usize; 2]; 9]; 3],
+    pub panel_sel: [[[usize; 2]; 10]; 3],
     pub confirm: Option<(Sub, usize)>,
     pub burn_request: Option<BurnRequest>,
     pub log: Vec<LogLine>,
@@ -370,6 +370,8 @@ mod panel_navigation_tests {
         st.on_key(key(KeyCode::Char('>')));
         assert_eq!(st.page[Sub::Exp.idx()], 8);
         assert_eq!(st.sim.exp.cam_sel, 1);
+        st.on_key(key(KeyCode::Char('>')));
+        assert_eq!(st.page[Sub::Exp.idx()], 9);
         st.on_key(key(KeyCode::Char('>')));
         assert_eq!(st.page[Sub::Exp.idx()], 0);
     }
@@ -564,8 +566,8 @@ impl State {
             tab: Tab::Home,
             sim: Sim::new(),
             page: [0; 3],
-            sel: [[0; 9]; 3],
-            panel_sel: [[[0; 2]; 9]; 3],
+            sel: [[0; 10]; 3],
+            panel_sel: [[[0; 2]; 10]; 3],
             confirm: None,
             burn_request: None,
             log: Vec::new(),
@@ -735,6 +737,7 @@ impl State {
             self.sim.enter_live();
             self.log.clear();
         }
+        self.sim.transfer = crate::data_transfer::Transfer::default();
         self.sim.live.set_mode(mode);
         if mode != Mode::Sim {
             self.sim.exp.motor_mode_verified = [false; 2];
@@ -761,9 +764,11 @@ impl State {
                     if !v.is_empty() {
                         if self.cfg_sel == 1 {
                             self.sim.live.console_path = v;
+                            self.sim.transfer = crate::data_transfer::Transfer::default();
                             self.sim.live.reconnect();
                         } else if self.cfg_sel == 2 {
                             self.sim.live.rs422_path = v;
+                            self.sim.transfer = crate::data_transfer::Transfer::default();
                             self.sim.live.reconnect();
                         } else if self.cfg_sel == 3 {
                             match v.parse::<f64>() {
@@ -824,6 +829,7 @@ impl State {
                 }
                 3 => self.cfg_edit = Some(format!("{:.1}", self.sim.live.poll_every)),
                 4 => {
+                    self.sim.transfer = crate::data_transfer::Transfer::default();
                     self.sim.live.reconnect();
                     self.push_local(Sub::Obc, Level::Info, "link re-opened");
                 }
@@ -1042,13 +1048,18 @@ impl State {
                 KeyCode::Esc => self.num_edit = None,
                 KeyCode::Enter => {
                     let (min, max) = match control_by_id(id).map(|c| &c.kind) {
-                        Some(Kind::Step { min, max, .. }) => (*min, *max),
+                        Some(Kind::Step { min, max, .. }) => (*min as i64, *max as i64),
+                        Some(Kind::Unsigned) => (0, u32::MAX as i64),
                         _ => return,
                     };
-                    match buf.parse::<i32>() {
+                    match buf.parse::<i64>() {
                         Ok(value) if (min..=max).contains(&value) => {
                             self.num_edit = None;
-                            self.sim.set_num(id, value);
+                            if id == "obc.dat_index" {
+                                self.sim.transfer.index = value as u32;
+                            } else {
+                                self.sim.set_num(id, value as i32);
+                            }
                             self.pump_logs();
                         }
                         _ => self.push_local(
@@ -1389,6 +1400,12 @@ impl State {
             return;
         }
         match &c.kind {
+            Kind::Unsigned => {
+                if let Val::Unsigned(v) = self.sim.value(c.id) {
+                    self.num_edit = Some((c.id, v.to_string()));
+                    self.num_edit_replace = true;
+                }
+            }
             Kind::Toggle => {
                 if let Val::Bool(b) = self.sim.value(c.id) {
                     self.sim.set_bool(c.id, !b);
@@ -1427,6 +1444,33 @@ impl State {
             Kind::Danger => {
                 self.confirm = Some((sub, i));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod data_transfer_editor_tests {
+    use super::*;
+    #[test]
+    fn file_index_accepts_full_u32_and_stages_without_sending() {
+        let mut st = State::new();
+        st.tab = Tab::Obc;
+        st.page[Sub::Obc.idx()] = 2;
+        let i = Sub::Obc
+            .controls(2)
+            .iter()
+            .position(|c| c.id == "obc.dat_index")
+            .unwrap();
+        for (text, valid) in [("4294967295", true), ("4294967296", false)] {
+            st.activate(Sub::Obc, i, 0, false);
+            for c in text.chars() {
+                st.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            st.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(st.num_edit.is_none(), valid);
+            assert_eq!(st.sim.transfer.index, u32::MAX);
+            assert!(!st.sim.transfer.busy);
+            assert!(st.sim.transfer.selected.is_none());
         }
     }
 }

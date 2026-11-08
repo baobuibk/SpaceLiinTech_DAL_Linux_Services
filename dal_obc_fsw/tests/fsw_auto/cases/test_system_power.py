@@ -13,7 +13,7 @@ from fsw_auto import fixtures
 from fsw_auto.fake_exp import ExpModel
 from fsw_auto.fixtures import FswTestCase
 
-SYS_INFO, SYS_RTC, VOUT, PEN, PST = 0x00, 0x01, 0x02, 0x03, 0x04
+SYS_INFO, SYS_RTC, VOUT, PEN, PST = 0x00, 0x01, 0x02, 0x32, 0x04
 
 
 class RtcSandbox(unittest.TestCase):
@@ -136,15 +136,15 @@ class Vout(Base):
         self.assertEqual(self.fields(self.vout()), (0xFFFF, 0, 0, VOLT_VALID | CURR_VALID))
 
     def test_vout_02_set_programs_pdu_and_reads_back(self):
-        setpoint, mv, ma, flags = self.fields(self.vout(struct.pack("<H", 5000)))
+        setpoint, mv, ma, flags = self.fields(self.vout(struct.pack("<H6x", 5000)))
         self.assertEqual((setpoint, mv, ma), (5000, 0, 0))                     # VOUT output still off
-        self.assertEqual(flags, TRANS_ON | SET_VALID | VOLT_VALID | CURR_VALID)  # TRANS powered first
+        self.assertEqual(flags, TRANS_ON | SET_VALID | VOLT_VALID | CURR_VALID | 0x20)  # TRANS powered first
         self.assertEqual([w for w in self.fsw.pdu.writes()], [(6, 0, 5000)])
 
     def test_vout_03_range(self):
         for mv, ok in ((799, False), (800, True), (20000, True), (20001, False)):
             with self.subTest(mv):
-                tm = self.vout(struct.pack("<H", mv))
+                tm = self.vout(struct.pack("<H6x", mv))
                 tm.expect_ack(1, VOUT, 8) if ok else tm.expect_err(1)
         self.assertEqual([w[2] for w in self.fsw.pdu.writes()], [800, 20000])  # rejects never reach the PDU
 
@@ -155,7 +155,7 @@ class Vout(Base):
     def test_vout_05_pdu_down(self):
         self.fsw.pdu.online = False
         self.link.txrx(1, VOUT, timeout=10).expect_err(3)
-        self.link.txrx(1, VOUT, struct.pack("<H", 5000), timeout=10).expect_err(3)
+        self.link.txrx(1, VOUT, struct.pack("<H6x", 5000), timeout=10).expect_err(3)
 
     def test_vout_06_pdu_rejects_value(self):
         # OBC accepts 800..20000, so make the PDU the one that refuses
@@ -163,14 +163,14 @@ class Vout(Base):
         old = fp.SETPOINT_RANGE
         fp.SETPOINT_RANGE = (6000, 7000)
         try:
-            self.link.txrx(1, VOUT, struct.pack("<H", 5000)).expect_err(3)
+            self.link.txrx(1, VOUT, struct.pack("<H6x", 5000)).expect_err(3)
         finally:
             fp.SETPOINT_RANGE = old
 
     def test_vout_07_identity_is_checked_before_a_write(self):
         self.fsw.pdu.build = 0
         self.fsw.pdu.requests.clear()
-        self.link.txrx(1, VOUT, struct.pack("<H", 5000)).expect_ack(1, VOUT, 8)
+        self.link.txrx(1, VOUT, struct.pack("<H6x", 5000)).expect_ack(1, VOUT, 8)
         self.assertEqual(self.fsw.pdu.requests[0], (3, 99, 2))                  # identity first
 
 
@@ -185,7 +185,7 @@ class PowerEnable(Base):
 
     def test_pen_01_get_all_boards(self):
         self.assertEqual(self.state(self.pen(OBC)), (OBC, 0, 0xFF, 0))
-        self.assertEqual(self.state(self.pen(PDU)), (PDU, 0, 3, 0))
+        self.assertEqual(self.state(self.pen(PDU)), (PDU, 0, 2, 0))
         self.assertEqual(self.state(self.pen(EXP)), (EXP, 0, 7, 0))
 
     def test_pen_02_bad_boards_and_lengths(self):
@@ -239,12 +239,12 @@ class PowerEnable(Base):
             (led / "brightness").write_text("0\n")
 
     def test_pen_10_pdu_vout_needs_a_setpoint(self):
-        self.assertEqual(self.state(self.pen(PDU, 1, 1)), (PDU, 0, 3, 1))     # PDU refuses, bit 0 failed
+        self.assertEqual(self.state(self.pen(PDU, 1, 1)), (PDU, 0, 2, 1))     # PDU refuses, bit 0 failed
 
     def test_pen_11_pdu_sequence(self):
-        self.link.txrx(1, VOUT, struct.pack("<H", 5000)).expect_ack(1, VOUT, 8)
+        self.link.txrx(1, VOUT, struct.pack("<H6x", 5000)).expect_ack(1, VOUT, 8)
         self.assertEqual(self.state(self.pen(PDU, 1, 1)), (PDU, 3, 3, 0))     # VOUT on pulled TRANS on
-        self.assertEqual(self.state(self.pen(PDU, 2, 0)), (PDU, 0, 3, 0))     # TRANS off dropped VOUT too
+        self.assertEqual(self.state(self.pen(PDU, 2, 0)), (PDU, 0, 2, 0))     # TRANS off dropped VOUT too
         self.assertEqual(self.state(self.pen(PDU, 3, 3)), (PDU, 3, 3, 0))
         self.assertEqual(self.state(self.pen(PDU, 1, 0)), (PDU, 2, 3, 0))     # VOUT off, TRANS stays
 
@@ -349,19 +349,24 @@ class PowerEnable(Base):
 
 class PowerStatus(Base):
     def stat(self, board, mask=0, timeout=10):
-        payload = struct.pack("<BH", board, mask)
-        p = self.link.txrx(1, PST, payload, timeout=timeout).expect_ack(1, PST)
-        board_id, count, epoch = struct.unpack_from("<BBI", p)
-        self.assertEqual(len(p), 6 + 12 * count)
-        recs = [struct.unpack_from("<BBHIi", p, 6 + 12 * i) for i in range(count)]
-        return board_id, epoch, recs
+        # Board/mask is a local test filter; native TC always uses report 0.
+        p=self.link.txrx(1,PST,b"\x00",timeout=timeout).expect_ack(1,PST)
+        schema,count,errors=struct.unpack_from("<HHH",p)
+        self.assertEqual(schema,0x200);self.assertEqual(len(p),22+6*count)
+        self.assertLessEqual(len(p),200)
+        recs=[]
+        for at in range(6,len(p)-16,6):
+            d,mv,ma=struct.unpack_from("<HHh",p,at);bit=d&15;flags=d>>7&31
+            if (d>>4&7)==board and (not mask or mask&(1<<bit)):
+                recs.append((bit,flags,0 if flags&FRESH else 0xffff,mv,ma))
+        return board,0,recs
 
     def test_pst_01_pdu_values_and_flags(self):
         pdu = self.fsw.pdu
         pdu.setpoint, pdu.vout_en, pdu.trans_en = 5000, True, True
         board, epoch, recs = self.stat(PDU)
         self.assertEqual(board, PDU)
-        self.assertAlmostEqual(epoch, time.time(), delta=5)
+        self.assertEqual(epoch, 0)  # v1.2 compact report has no epoch field
         by = {r[0]: r for r in recs}
         self.assertEqual(sorted(by), [0, 1, 2, 3])
         self.assertEqual(by[0][1], CONTROL_KNOWN | CONTROL_ON | VOLT_OK | CURR_OK | FRESH)
@@ -377,7 +382,7 @@ class PowerStatus(Base):
         self.assertEqual(by[0][1] & CURR_OK, 0)
         self.assertEqual(by[0][1] & VOLT_OK, VOLT_OK)
 
-    def test_pst_03_mask_selects_records(self):
+    def test_pst_03_local_filter_selects_records(self):
         _, _, recs = self.stat(PDU, 0b0101)
         self.assertEqual([r[0] for r in recs], [0, 2])
         _, _, recs = self.stat(PDU, 0b1000)
@@ -386,8 +391,8 @@ class PowerStatus(Base):
     def test_pst_04_invalid_board_or_mask(self):
         for board, mask in ((0, 0), (1, 0), (6, 0), (PDU, 0x10), (EXP, 0x80)):
             with self.subTest((board, mask)):
-                self.link.txrx(1, PST, struct.pack("<BH", board, mask)).expect_err(1)
-        for n in (0, 1, 2, 4):
+                self.link.txrx(1, PST, struct.pack("<BH", board, mask)).expect_err(0)
+        for n in (0, 2, 3, 4):
             self.link.txrx(1, PST, bytes(n)).expect_err(0)
 
     def test_pst_05_pdu_down_reports_everything_unavailable(self):

@@ -264,14 +264,21 @@ fn draw_filtered_channel(
         if i == sel && active {
             sel_line = Some(lines.len());
         }
-        lines.push(row_value(
+        let mut line = row_value(
             st,
             c,
             i == sel && active,
             w,
             focus,
             channel_value(st, c.id, channel),
-        ));
+        );
+        let camera = channel.unwrap_or(st.sim.exp.cam_sel);
+        if camera_buffer_redundant(c.id, st.sim.exp.camera[camera].buffer_enabled) {
+            for span in &mut line.spans {
+                span.style = span.style.fg(Color::DarkGray);
+            }
+        }
+        lines.push(line);
     }
 
     let h = parts[0].height as usize;
@@ -313,6 +320,13 @@ pub(super) fn row(
     focus: Style,
 ) -> Line<'static> {
     row_value(st, c, selected, w, focus, st.sim.value(c.id))
+}
+
+fn camera_buffer_redundant(id: &str, enabled: Option<bool>) -> bool {
+    matches!(
+        (id, enabled),
+        ("exp.cam_buffer_on", Some(true)) | ("exp.cam_buffer_off", Some(false))
+    )
 }
 
 fn channel_value(st: &State, id: &str, channel: Option<usize>) -> Val {
@@ -409,6 +423,7 @@ fn row_value(
                 };
             vec![txt(label, color)]
         }
+        (Kind::Unsigned, Val::Unsigned(v)) => vec![txt(format!("{v} [ EDIT ]"), Color::Green)],
         (Kind::Step { unit, .. }, Val::Num(v)) => {
             vec![txt(format!("{v} {unit} [ EDIT ]"), Color::Green)]
         }
@@ -468,4 +483,18 @@ fn row_value(
         }
     }
     Line::from(spans)
+}
+
+#[cfg(test)]
+mod camera_buffer_tests {
+    use super::*;
+    #[test]
+    fn dims_only_the_action_matching_confirmed_buffer_state() {
+        assert!(camera_buffer_redundant("exp.cam_buffer_on", Some(true)));
+        assert!(!camera_buffer_redundant("exp.cam_buffer_off", Some(true)));
+        assert!(camera_buffer_redundant("exp.cam_buffer_off", Some(false)));
+        assert!(!camera_buffer_redundant("exp.cam_buffer_on", Some(false)));
+        assert!(!camera_buffer_redundant("exp.cam_buffer_on", None));
+        assert!(!camera_buffer_redundant("exp.cam_buffer_off", None));
+    }
 }

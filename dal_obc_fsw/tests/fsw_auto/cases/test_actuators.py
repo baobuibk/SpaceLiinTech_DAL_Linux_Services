@@ -8,8 +8,8 @@ from fsw_auto.fake_exp import ExpModel
 from fsw_auto.fixtures import FswTestCase
 
 THM_CFG, THM_CTL, THM_STAT = 0x13, 0x14, 0x15
-FLD_CFG, FLD_CTL, FLD_STAT = 0x16, 0x17, 0x18
-RBA_CTL, RBA_STAT = 0x1A, 0x1B
+FLD_CFG, FLD_CTL, FLD_STAT = 0x16, 0x34, 0x18
+RBA_CTL, RBA_STAT = 0x33, 0x1B
 
 
 def tc8(a, b, c, d, value=0):
@@ -95,10 +95,10 @@ class Thermal(ActuatorCase):
     def test_thm_10_heater_manual_set_and_off(self):
         self.tx(THM_CTL, tc8(0, 2, 1, 40, 5000)).expect_ack(1, THM_CTL, 4)
         self.assertEqual(self.sent(), ["thm_wire_ctl 0 2 1 40 5000"])
-        stat = self.tx(THM_STAT).expect_ack(1, THM_STAT, 6)
-        self.assertEqual(stat, bytes((0, 0, 0x80 | 40, 0, 0, 0)))
+        stat = self.tx(THM_STAT).expect_ack(1, THM_STAT, 8)
+        self.assertEqual(stat, bytes((0, 0, 0x80 | 40, 0, 0, 0, 0, 0)))
         self.tx(THM_CTL, tc8(0, 2, 0, 0, 0)).expect_ack(1, THM_CTL, 4)
-        self.assertEqual(self.tx(THM_STAT).payload, bytes(6))
+        self.assertEqual(self.tx(THM_STAT).payload, bytes(8))
 
     def test_thm_11_ir_manual_and_stop(self):
         self.tx(THM_CTL, tc8(1, 1, 1, 10)).expect_ack(1, THM_CTL, 4)
@@ -126,7 +126,7 @@ class Thermal(ActuatorCase):
         self.exp_responder.power["exp12v"] = True
         self.tx(THM_CTL, tc8(0, 0, 1, 90, 1000)).expect_err(0x01)                  # above the 80 % ceiling
         self.tx(THM_CTL, tc8(0, 0, 1, 10, 20000)).expect_err(0x01)                 # longer than max on time
-        self.assertEqual(self.tx(THM_STAT).payload, bytes(6))
+        self.assertEqual(self.tx(THM_STAT).payload, bytes(8))
 
     def test_thm_13b_profile_owner_refuses_manual_commands(self):
         self.assertEqual(self.exp_responder.thermal.ctl("08", True), "THP_CTL c1")

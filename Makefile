@@ -99,3 +99,8 @@ package-sensor-sources:
 
 package-dal-obc-fsw:
 	python3 package_dal_obc_fsw.py
+
+# Optional Windows client package; kept separate from Linux OBC deployment.
+.PHONY: daltui-windows
+daltui-windows:
+	daltui/tools/build-windows.sh

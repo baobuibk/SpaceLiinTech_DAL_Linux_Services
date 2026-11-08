@@ -106,7 +106,7 @@ Thermal (`thm_*`), fluidic (`fld_*`), RBA motor (`rba_*`),
 PC experiment (`pc_*`) and thermal-profile (`thp_*`) commands are bridged to the EXP over
 its UART CLI; the register lists each TYPE/ADDRESS.
 
-File types are `0` = logs, `1` = images, and `2` = data. File indexes are
+File types are `0` = HK housekeeping (`logs/hk`), `1` = SCI1 images, and `2` = SCI2 LWL/PC logs (`logs/lwl`, `logs/pc`). File indexes are
 zero-based and fit in a U16. `chunk_size` is 1–32768 bytes; `dat_get` uses a
 zero-based U32 chunk index. `dat_mark` accepts 0–254; `0xFF` is reserved.
 `dat_lst` returns counts, so select files by type and index to obtain names.
@@ -327,7 +327,7 @@ before using a numeric value.
 For a local inspection of an HK file:
 
 ```text
-flight> dat_lst
+flight> dat_lst 0xFF
 flight> dat_sel 0 0 1024
 flight> dat_get 0
 flight> dat_get 1

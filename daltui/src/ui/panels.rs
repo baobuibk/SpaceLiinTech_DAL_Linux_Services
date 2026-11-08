@@ -20,6 +20,13 @@ pub fn draw(f: &mut Frame, st: &State, sub: Sub, area: Rect) {
     let rl: RailFn = if two { rail_line_c } else { rail_line };
     let page = st.page[sub.idx()];
     let (a, b) = match sub {
+        Sub::Obc if page == 2 => (
+            vec![p(
+                "DATA TRANSFER STATUS",
+                st.sim.transfer.lines().into_iter().map(Line::raw).collect(),
+            )],
+            vec![],
+        ),
         Sub::Obc => obc(&st.sim, rl),
         Sub::Exp => exp(&st.sim, rl, page),
         Sub::Pdu => pdu(&st.sim, rl),
@@ -182,6 +189,7 @@ fn exp(s: &Sim, rail_line: RailFn, page: usize) -> (Vec<Panel>, Vec<Panel>) {
         4 => return exp_ir(s),
         5 => return exp_burn(s),
         8 => return exp_camera(s, 36),
+        9 => return exp_sensors(s),
         _ => {}
     }
     let link = if e.link {
@@ -390,7 +398,61 @@ fn exp_camera(s: &Sim, content_width: usize) -> (Vec<Panel>, Vec<Panel>) {
         } else {
             "n/a"
         };
+        let (monitor_status, monitor_color) = if c.monitor_enabled == Some(false) {
+            if c.monitor_running {
+                ("stopping...".into(), Color::Magenta)
+            } else {
+                ("stopped".into(), Color::White)
+            }
+        } else if c.address_restart_required {
+            ("sensor restart needed".into(), Color::Yellow)
+        } else if !c.initialized && (c.confirmed || c.monitor.is_some()) {
+            ("don't init".into(), Color::Yellow)
+        } else if c.buffer_enabled == Some(false) {
+            ("I2C buffer disabled".into(), Color::Yellow)
+        } else if let Some(m) = &c.monitor {
+            if m.error != 0 {
+                let reason = match m.error {
+                    -1 => "I2C read failed",
+                    -30 => "sensor timeout",
+                    -34 => "frame changed",
+                    -35 => "invalid temperature",
+                    -40 => "incomplete subpages",
+                    _ => "read failed",
+                };
+                (format!("{reason} ({})", m.error), Color::Red)
+            } else if !m.valid || m.sequence == 0 {
+                ("waiting for sample".into(), Color::Magenta)
+            } else {
+                ("OK / 10s".into(), Color::Green)
+            }
+        } else {
+            ("not read".into(), Color::Yellow)
+        };
+        // Keep the last successfully read temperatures regardless of sample age
+        // or a later failed attempt. The status above describes the interruption.
+        let last_sample = c.monitor.as_ref().filter(|m| m.sequence > 0);
+        let peak = c
+            .peak
+            .or_else(|| last_sample.map(|m| (m.max_centi, m.x, m.y)));
+        let mean = c
+            .frame_mean_centi
+            .or_else(|| last_sample.map(|m| m.mean_centi));
         let lines = vec![
+            kv1("Auto monitor", 16, monitor_status, monitor_color),
+            kv1(
+                "Max temperature",
+                16,
+                temperature(peak.map(|p| p.0)),
+                Color::White,
+            ),
+            kv1("Average temp", 16, temperature(mean), Color::White),
+            kv1(
+                "Max position",
+                16,
+                peak.map_or("n/a".into(), |(_, x, y)| format!("({x}, {y})")),
+                Color::White,
+            ),
             kv1(
                 "Sensor / address",
                 16,
@@ -444,7 +506,7 @@ fn exp_camera(s: &Sim, content_width: usize) -> (Vec<Panel>, Vec<Panel>) {
                 },
             ),
             kv1(
-                "Capture",
+                "Operation",
                 16,
                 c.result.clone(),
                 if c.result == "OK" {
@@ -454,19 +516,13 @@ fn exp_camera(s: &Sim, content_width: usize) -> (Vec<Panel>, Vec<Panel>) {
                 },
             ),
             kv1(
-                "PSRAM object",
-                16,
-                if c.object_id > 0 {
-                    c.object_id.to_string()
-                } else {
-                    "n/a".into()
-                },
-                Color::White,
-            ),
-            kv1(
                 "Saved image",
                 16,
-                saved,
+                if c.object_id > 0 {
+                    format!("#{} {saved}", c.object_id)
+                } else {
+                    saved.into()
+                },
                 if c.saved_file.is_some() {
                     Color::Green
                 } else {
@@ -474,20 +530,23 @@ fn exp_camera(s: &Sim, content_width: usize) -> (Vec<Panel>, Vec<Panel>) {
                 },
             ),
             kv1(
-                "Max temperature",
+                "Point (x,y,d)",
                 16,
-                temperature(c.peak.map(|p| p.0)),
+                c.point_coords
+                    .map_or("n/a".into(), |(x, y, d)| format!("({x}, {y}, {d})")),
                 Color::White,
             ),
+            kv1("Point center", 16, temperature(c.temp_centi), Color::White),
             kv1(
-                "Max position",
+                "Point max / avg",
                 16,
-                c.peak
-                    .map_or("n/a".into(), |(_, x, y)| format!("({x}, {y})")),
+                format!(
+                    "{} / {}",
+                    temperature(c.point_max_centi),
+                    temperature(c.mean_centi)
+                ),
                 Color::White,
             ),
-            kv1("Point max", 16, temperature(c.temp_centi), Color::White),
-            kv1("Point average", 16, temperature(c.mean_centi), Color::White),
         ];
         cards.push(p(
             if i == 0 {
@@ -969,70 +1028,171 @@ fn exp_motors(s: &Sim) -> (Vec<Panel>, Vec<Panel>) {
 
 fn pdu(s: &Sim, rail_line: RailFn) -> (Vec<Panel>, Vec<Panel>) {
     let d = &s.pdu;
+    let live = s.live.mode != crate::link::Mode::Sim;
+    let valid = if live {
+        d.status.map_or(0, |x| x.valid)
+    } else {
+        127
+    };
+    let tps = if live {
+        d.status.map_or(0, |x| x.tps)
+    } else if d.trans_en {
+        3
+    } else {
+        1
+    };
+    let flags = if live {
+        d.status.map_or(0, |x| x.flags)
+    } else {
+        (d.led_state as u16)
+            | (d.trans_en as u16) << 1
+            | (d.trans_fault as u16) << 2
+            | (d.mcu_fault as u16) << 3
+            | (d.latched as u16) << 4
+    };
+    let tps_label = [
+        "UNKNOWN",
+        "NOT POWERED — TRANS OFF",
+        "STARTING",
+        "READY",
+        "COMM ERROR",
+    ][tps.min(4) as usize];
     let mode = ["NORMAL", "MANUAL", "WARNING", "ERROR"][d.mode.min(3)];
     let mode_c = [Color::Green, Color::Cyan, Color::Yellow, Color::Red][d.mode.min(3)];
-    let flags = (d.led_state as u16)
-        | (d.trans_en as u16) << 1
-        | (d.trans_fault as u16) << 2
-        | (d.mcu_fault as u16) << 3
-        | (d.latched as u16) << 4;
     let status = vec![
         kv(
             "Link",
             11,
             vec![
-                if d.online {
+                if if live { valid != 0 } else { d.online } {
                     txt("ONLINE", Color::Green)
                 } else {
                     txt("OFFLINE", Color::Red)
                 },
-                txt("  ttyS3 115200", Color::DarkGray),
+                txt("  Modbus via OBC", Color::DarkGray),
             ],
         ),
         kv(
             "Mode",
             11,
             vec![Span::styled(
-                mode,
+                if valid & 2 != 0 { mode } else { "N/A" },
                 Style::default().fg(mode_c).add_modifier(Modifier::BOLD),
             )],
         ),
-        kv1("Status flags", 12, format!("0x{flags:04X}"), Color::White),
+        kv1(
+            "Status flags",
+            12,
+            if valid & 1 != 0 {
+                format!("0x{flags:04X}")
+            } else {
+                "N/A".into()
+            },
+            Color::White,
+        ),
+        kv1(
+            "TPS55287",
+            11,
+            tps_label,
+            if tps == 4 {
+                Color::Red
+            } else if tps == 2 {
+                Color::Magenta
+            } else {
+                Color::White
+            },
+        ),
         kv1(
             "Board temp",
             11,
             if d.temp.is_nan() {
                 "n/a".to_string()
             } else {
-                format!("{:.1} °C  (limit {} °C)", d.temp, d.temp_limit)
+                format!("{:.1} °C", d.temp)
             },
             temp_color(d.temp, d.temp_limit as f32 - 15.0, d.temp_limit as f32),
         ),
-        kv1("Setpoint", 11, format!("{} mV", d.vout_set), Color::White),
+        kv1(
+            "Setpoint",
+            11,
+            if valid & 32 != 0 {
+                format!("{} mV", d.vout_set)
+            } else {
+                "N/A".into()
+            },
+            Color::White,
+        ),
         kv1(
             "Boot",
             11,
-            format!("#{}  {}", d.boot_count, d.boot_cause),
+            if live {
+                "N/A".into()
+            } else {
+                format!("#{}  {}", d.boot_count, d.boot_cause)
+            },
             Color::White,
         ),
-        kv1("Clock", 11, civil(s.rtc_now()), Color::White),
-        kv1("Poll age", 11, format!("{:.0} s", d.poll_age), Color::White),
+        kv1("OBC clock", 11, civil(s.rtc_now()), Color::White),
+        kv1(
+            "Poll age",
+            11,
+            if d.poll_age.is_finite() {
+                format!("{:.1} s", d.poll_age)
+            } else {
+                "N/A".into()
+            },
+            Color::White,
+        ),
     ];
-    let mut rails: Vec<Line> = d.rails.iter().map(|r| rail_line(r, 11)).collect();
+    let mut rails: Vec<Line> = d
+        .rails
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            if !live {
+                return rail_line(r, 11);
+            }
+            let v = d.power_valid[i];
+            kv1(
+                r.name,
+                11,
+                format!(
+                    "{}   {}",
+                    if v[0] {
+                        format!("{:.2} V", r.mv as f32 / 1000.0)
+                    } else {
+                        "N/A V".into()
+                    },
+                    if v[1] {
+                        format!("{} mA", r.ma)
+                    } else {
+                        "N/A mA".into()
+                    }
+                ),
+                Color::White,
+            )
+        })
+        .collect();
     rails.push(kv1(
         "Total out",
         11,
-        format!(
-            "{:5.2} W",
-            (d.rails[0].mw() + d.rails[2].mw() + d.rails[3].mw()) as f32 / 1000.0
-        ),
+        if live && !(d.power_valid[0].iter().all(|x| *x) && d.power_valid[2].iter().all(|x| *x)) {
+            "N/A".into()
+        } else {
+            format!(
+                "{:5.2} W",
+                (d.rails[0].mw() + d.rails[2].mw() + d.rails[3].mw()) as f32 / 1000.0
+            )
+        },
         Color::White,
     ));
-    let flag = |label: &str, on: bool, bad: bool| {
+    let flag = |label: &str, on: bool, bad: bool, known: bool| {
         kv(
             label,
             18,
-            vec![if on {
+            vec![if !known {
+                txt("N/A", Color::White)
+            } else if on {
                 txt("YES", if bad { Color::Red } else { Color::Green })
             } else {
                 txt("no", Color::DarkGray)
@@ -1040,12 +1200,17 @@ fn pdu(s: &Sim, rail_line: RailFn) -> (Vec<Panel>, Vec<Panel>) {
         )
     };
     let faults = vec![
-        flag("TRANS eFuse fault", d.trans_fault, true),
-        flag("MCU eFuse fault", d.mcu_fault, true),
-        flag("Latched fault", d.latched, true),
-        flag("Heartbeat output", d.led_state && d.heartbeat, false),
-        flag("TRANS output", d.trans_en, false),
-        flag("VOUT output", d.vout_en, false),
+        flag("TRANS eFuse fault", d.trans_fault, true, valid & 1 != 0),
+        flag("MCU eFuse fault", d.mcu_fault, true, valid & 1 != 0),
+        flag("Latched fault", d.latched, true, valid & 1 != 0),
+        flag(
+            "Heartbeat output",
+            d.led_state && d.heartbeat,
+            false,
+            valid & 1 != 0,
+        ),
+        flag("TRANS output", d.trans_en, false, valid & 8 != 0),
+        flag("VOUT output", d.vout_en, false, valid & 16 != 0),
     ];
     let event = vec![
         kv1("Sequence", 11, cnt(d.event_seq), Color::White),
@@ -1064,4 +1229,230 @@ fn pdu(s: &Sim, rail_line: RailFn) -> (Vec<Panel>, Vec<Panel>) {
         vec![p("Status", status), p("Rails", rails)],
         vec![p("Faults / outputs", faults), p("Events", event)],
     )
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+    use crate::sim::CameraMonitor;
+
+    #[test]
+    fn last_temperature_remains_visible_with_direct_interruption_status() {
+        let mut sim = Sim::new();
+        sim.exp.camera[0].initialized = true;
+        sim.exp.camera[0].monitor = Some(CameraMonitor {
+            valid: true,
+            error: 0,
+            sequence: 1,
+            max_centi: 3210,
+            mean_centi: 2500,
+            x: 31,
+            y: 23,
+        });
+        let rows = |sim: &Sim| {
+            exp_camera(sim, 40).0[0]
+                .lines
+                .iter()
+                .take(3)
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let fresh = rows(&sim);
+        assert!(fresh[0].contains("OK"));
+        assert!(fresh[1].contains("32.10"));
+        assert!(fresh[2].contains("25.00"));
+        sim.t = 7.0;
+        let stale = rows(&sim);
+        assert!(stale[0].contains("OK"));
+        assert!(stale[1].contains("32.10") && stale[2].contains("25.00"));
+        let m = sim.exp.camera[0].monitor.as_mut().unwrap();
+        m.valid = false;
+        m.error = -12;
+        let failed = rows(&sim);
+        assert!(failed[0].contains("read failed (-12)"));
+        assert!(failed[1].contains("32.10"));
+        sim.exp.camera[0].buffer_enabled = Some(false);
+        assert!(rows(&sim)[0].contains("I2C buffer disabled"));
+        sim.exp.camera[0].initialized = false;
+        assert!(rows(&sim)[0].contains("don't init"));
+        assert!(rows(&sim)[1].contains("32.10"));
+        sim.exp.camera[0].monitor_enabled = Some(false);
+        sim.exp.camera[0].monitor_running = true;
+        assert!(rows(&sim)[0].contains("stopping..."));
+        sim.exp.camera[0].monitor_running = false;
+        assert!(rows(&sim)[0].contains("stopped"));
+        assert!(rows(&sim)[1].contains("32.10"));
+        sim.exp.camera[0].monitor.as_mut().unwrap().sequence = 0;
+        assert!(rows(&sim)[1].contains("n/a"));
+    }
+}
+
+fn exp_sensors(s: &Sim) -> (Vec<Panel>, Vec<Panel>) {
+    let e = &s.exp;
+    let mut bme = vec![];
+    let mut imu = vec![];
+    if let Some((d, valid)) = e.sensor_actual {
+        let os = ["skip", "1x", "2x", "4x", "8x", "16x"];
+        bme.push(kv1(
+            "Config",
+            12,
+            if valid[0] {
+                "OK / applied"
+            } else {
+                "not available"
+            },
+            Color::White,
+        ));
+        imu.push(kv1(
+            "Config",
+            12,
+            if valid[1] {
+                "OK / applied"
+            } else {
+                "not available"
+            },
+            Color::White,
+        ));
+        if valid[0] {
+            bme.push(kv1(
+                "T / P / H",
+                12,
+                format!(
+                    "{} / {} / {}",
+                    os[d[0] as usize], os[d[1] as usize], os[d[2] as usize]
+                ),
+                Color::White,
+            ));
+            bme.push(kv1(
+                "Filter",
+                12,
+                ["off", "1", "3", "7", "15", "31", "63", "127"][d[3] as usize],
+                Color::White,
+            ));
+        }
+        if valid[1] {
+            let rates = ["off", "12.5", "26", "52", "104", "208", "416", "833"];
+            imu.push(kv1(
+                "Accel",
+                12,
+                format!(
+                    "{} Hz / {}",
+                    rates[d[4] as usize],
+                    ["2g", "16g", "4g", "8g"][d[5] as usize]
+                ),
+                Color::White,
+            ));
+            imu.push(kv1(
+                "Gyro",
+                12,
+                format!(
+                    "{} Hz / {} dps",
+                    rates[d[6] as usize],
+                    [125, 250, 500, 1000, 2000][d[7] as usize]
+                ),
+                Color::White,
+            ));
+            imu.push(kv1(
+                "Free-fall",
+                12,
+                format!("threshold {} / duration {}", d[8], d[9]),
+                Color::White,
+            ));
+            imu.push(kv1(
+                "Wake-up",
+                12,
+                format!("threshold {} / duration {}", d[10], d[11]),
+                Color::White,
+            ));
+        }
+    } else {
+        bme.push(kv1("Config", 12, "Read both configs", Color::Magenta));
+        imu.push(kv1("Config", 12, "Read both configs", Color::Magenta));
+    }
+    for (i, lines) in [(0, &mut bme), (1, &mut imu)] {
+        if let Some(values) = &e.sensor_readings[i] {
+            let labels: &[&str] = if i == 0 {
+                &["Temperature", "Pressure", "Humidity"]
+            } else {
+                &[
+                    "Temperature",
+                    "Accel X",
+                    "Accel Y",
+                    "Accel Z",
+                    "Gyro X",
+                    "Gyro Y",
+                    "Gyro Z",
+                ]
+            };
+            for (j, value) in values.iter().enumerate() {
+                let text = match value {
+                    None => "unavailable".into(),
+                    Some(v) if j == 0 => format!("{:.2} C", *v as f32 / 100.0),
+                    Some(v) if i == 0 && j == 1 => format!("{} Pa", *v as i32 * 10),
+                    Some(v) if i == 0 => format!("{:.2} %", *v as f32 / 100.0),
+                    Some(v) => format!("{v} {}", if j < 4 { "mg" } else { "dps" }),
+                };
+                lines.push(kv1(labels[j], 12, text, Color::White));
+            }
+        } else {
+            lines.push(kv1(
+                "Measurements",
+                12,
+                "Read sensor status",
+                Color::Magenta,
+            ));
+        }
+    }
+    (
+        vec![
+            p("EXP BME CONFIG / STATUS", bme),
+            p("EXP IMU CONFIG / STATUS", imu),
+        ],
+        vec![],
+    )
+}
+
+#[cfg(test)]
+mod pdu_validity_tests {
+    use super::*;
+    #[test]
+    fn unpowered_tps_and_missing_measurements_are_not_reported_as_zero() {
+        let mut s = Sim::new();
+        s.live.mode = crate::link::Mode::Rs422;
+        s.pdu.status = Some(crate::proto::PduStatus {
+            valid: 15,
+            flags: 0,
+            mode: 0,
+            tps: 1,
+            temp: 251,
+            age_ms: 0,
+            setpoint: 65535,
+        });
+        s.pdu.temp = 25.1;
+        s.pdu.power_valid = [[false; 2]; 4];
+        let (a, b) = pdu(&s, rail_line);
+        let lines: Vec<String> = a
+            .into_iter()
+            .chain(b)
+            .flat_map(|p| p.lines)
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let text = lines.join("\n");
+        assert!(text.contains("NOT POWERED — TRANS OFF"));
+        assert!(text.contains("25.1 °C"));
+        assert!(text.contains("N/A V"));
+        assert!(!text.contains("0.00 V"));
+        let vout = lines.iter().find(|l| l.contains("VOUT output")).unwrap();
+        assert!(vout.contains("N/A"));
+    }
 }
